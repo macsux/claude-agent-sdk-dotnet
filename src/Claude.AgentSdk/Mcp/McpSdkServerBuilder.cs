@@ -1,18 +1,40 @@
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.Json.Schema;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Claude.AgentSdk;
+using Claude.AgentSdk.Internal;
 
 namespace Claude.AgentSdk.Mcp;
 
 /// <summary>
 /// Builds an in-process ("sdk") MCP server configuration with strongly-typed tool registration.
 /// </summary>
+/// <remarks>
+/// <para>Three ways to register a tool:</para>
+/// <list type="bullet">
+/// <item><description><see cref="Tool(string, JsonElement, Func{JsonElement, CancellationToken, Task{McpToolResult}}, string?, McpToolAnnotations?)"/>:
+/// an explicit JSON Schema and a handler over the raw JSON arguments. Trim- and NativeAOT-safe.</description></item>
+/// <item><description><see cref="Tool{TArgs}(string, JsonTypeInfo{TArgs}, Func{TArgs, CancellationToken, Task{McpToolResult}}, string?, McpToolAnnotations?)"/>:
+/// a typed arguments object bound through source-generated <see cref="JsonTypeInfo{T}"/> metadata, with the
+/// schema derived from the same metadata. Trim- and NativeAOT-safe.</description></item>
+/// <item><description><see cref="Tool(string, Delegate, string?, McpToolAnnotations?)"/>: any delegate; schema
+/// and binding are inferred by reflection. Convenient, but not trim/AOT-compatible.</description></item>
+/// </list>
+/// </remarks>
 public sealed class McpSdkServerBuilder
 {
+    internal const string DelegateToolRequiresMessage =
+        "Tool(string, Delegate, ...) infers the input schema and binds arguments by reflecting over the delegate's " +
+        "parameter types, which trimming and NativeAOT cannot preserve. Use the Tool overload that takes an explicit " +
+        "JSON schema, or the one that takes a JsonTypeInfo<TArgs> from a JsonSerializerContext.";
+
     private readonly string _serverName;
     private readonly Dictionary<string, ToolRegistration> _tools = new(StringComparer.Ordinal);
 
@@ -37,17 +59,117 @@ public sealed class McpSdkServerBuilder
     /// Parameters with a default value, and nullable parameters (<c>int?</c>, <c>string?</c>), are optional;
     /// nullable ones also accept an explicit JSON <c>null</c>. Recursive parameter types are supported
     /// (the schema is cut at the point of recursion with a permissive <c>{"type": "object"}</c>).
+    /// <para>This overload uses reflection and is not trim/NativeAOT-compatible; see the
+    /// <see cref="McpSdkServerBuilder"/> remarks for the AOT-safe alternatives.</para>
     /// </remarks>
+    [RequiresUnreferencedCode(DelegateToolRequiresMessage)]
+    [RequiresDynamicCode(DelegateToolRequiresMessage)]
     public McpSdkServerBuilder Tool(string name, Delegate handler, string? description = null, McpToolAnnotations? annotations = null)
+    {
+        ValidateName(name);
+        ArgumentNullException.ThrowIfNull(handler);
+        _tools[name] = DelegateToolRegistration.Create(name, description, handler, annotations);
+        return this;
+    }
+
+    /// <summary>
+    /// Register a tool with an explicit input JSON Schema and a handler that receives the raw
+    /// JSON arguments. Trim- and NativeAOT-safe.
+    /// </summary>
+    /// <param name="name">Tool name.</param>
+    /// <param name="inputSchema">JSON Schema for the arguments; its root must be an object schema
+    /// (<c>{"type": "object", ...}</c>). Arguments are validated against it before the handler runs.</param>
+    /// <param name="handler">Receives the arguments object (never <c>null</c>; <c>{}</c> when the
+    /// caller sent none) and the request's cancellation token.</param>
+    /// <param name="description">Tool description shown to the model.</param>
+    /// <param name="annotations">Tool behavior hints.</param>
+    public McpSdkServerBuilder Tool(
+        string name,
+        JsonElement inputSchema,
+        Func<JsonElement, CancellationToken, Task<McpToolResult>> handler,
+        string? description = null,
+        McpToolAnnotations? annotations = null)
+    {
+        ValidateName(name);
+        ArgumentNullException.ThrowIfNull(handler);
+        if (inputSchema.ValueKind != JsonValueKind.Object)
+            throw new ArgumentException("The input schema must be a JSON object.", nameof(inputSchema));
+
+        _tools[name] = new HandlerToolRegistration(name, description, inputSchema.Clone(), handler, annotations);
+        return this;
+    }
+
+    /// <summary>
+    /// Register a tool whose arguments bind to <typeparamref name="TArgs"/> through source-generated
+    /// metadata. The input schema is derived from the same metadata (via
+    /// <see cref="JsonSchemaExporter"/>), so property names, required members and enum handling follow
+    /// the <see cref="JsonSerializerContext"/> that produced <paramref name="argsTypeInfo"/>.
+    /// Trim- and NativeAOT-safe.
+    /// </summary>
+    /// <param name="name">Tool name.</param>
+    /// <param name="argsTypeInfo">Metadata for the arguments type, e.g. <c>MyJsonContext.Default.AddArgs</c>.
+    /// The type must serialize as a JSON object.</param>
+    /// <param name="handler">Receives the deserialized arguments and the request's cancellation token.</param>
+    /// <param name="description">Tool description shown to the model.</param>
+    /// <param name="annotations">Tool behavior hints.</param>
+    public McpSdkServerBuilder Tool<TArgs>(
+        string name,
+        JsonTypeInfo<TArgs> argsTypeInfo,
+        Func<TArgs, CancellationToken, Task<McpToolResult>> handler,
+        string? description = null,
+        McpToolAnnotations? annotations = null)
+    {
+        ValidateName(name);
+        ArgumentNullException.ThrowIfNull(argsTypeInfo);
+        ArgumentNullException.ThrowIfNull(handler);
+
+        var schema = BuildSchema(argsTypeInfo);
+        _tools[name] = new HandlerToolRegistration(name, description, schema, async (args, ct) =>
+        {
+            var value = args.Deserialize(argsTypeInfo)
+                        ?? throw new ArgumentException("Tool arguments must be a JSON object.");
+            return await handler(value, ct).ConfigureAwait(false);
+        }, annotations);
+        return this;
+    }
+
+    private void ValidateName(string name)
     {
         if (string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("Tool name must be non-empty.", nameof(name));
 
         if (_tools.ContainsKey(name))
             throw new ArgumentException($"Tool '{name}' is already registered.", nameof(name));
+    }
 
-        _tools[name] = ToolRegistration.Create(name, description, handler, annotations);
-        return this;
+    /// <summary>
+    /// Input schema for a typed tool: the exported schema of <paramref name="typeInfo"/>, whose
+    /// root must be an object and is never nullable (the CLI always sends an arguments object).
+    /// </summary>
+    internal static JsonElement BuildSchema(JsonTypeInfo typeInfo)
+    {
+        var node = JsonSchemaExporter.GetJsonSchemaAsNode(typeInfo, new JsonSchemaExporterOptions
+        {
+            TreatNullObliviousAsNonNullable = true
+        });
+
+        if (node is not JsonObject root)
+            throw new ArgumentException(
+                $"Tool arguments type '{typeInfo.Type}' must serialize as a JSON object.", nameof(typeInfo));
+
+        switch (root["type"])
+        {
+            case JsonValue v when v.TryGetValue<string>(out var t) && t == "object":
+                break;
+            case JsonArray types when types.Any(x => x?.GetValue<string>() == "object"):
+                root["type"] = "object";
+                break;
+            default:
+                throw new ArgumentException(
+                    $"Tool arguments type '{typeInfo.Type}' must serialize as a JSON object.", nameof(typeInfo));
+        }
+
+        return SdkJson.SerializeToElement(root);
     }
 
     internal McpSdkServerConfig Build()
@@ -88,24 +210,12 @@ public sealed class McpSdkServerBuilder
         };
     }
 
-    private sealed class ToolRegistration
+    private abstract class ToolRegistration
     {
-        private static readonly JsonSerializerOptions ToolJsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true,
-            // The schema advertises enums by name, so bind (and report) them by name too.
-            Converters = { new JsonStringEnumConverter() }
-        };
-
-        private readonly Delegate _handler;
-        private readonly BindingPlan _bindingPlan;
-
         public McpToolDefinition Definition { get; }
 
-        private ToolRegistration(string name, string? description, JsonElement inputSchema, Delegate handler, BindingPlan bindingPlan, McpToolAnnotations? annotations)
+        protected ToolRegistration(string name, string? description, JsonElement inputSchema, McpToolAnnotations? annotations)
         {
-            _handler = handler;
-            _bindingPlan = bindingPlan;
             Definition = new McpToolDefinition
             {
                 Name = name,
@@ -116,6 +226,8 @@ public sealed class McpSdkServerBuilder
             };
         }
 
+        public abstract Task<McpToolResult> InvokeAsync(JsonElement args, CancellationToken ct);
+
         // Client-specific hints travel in _meta under namespaced keys because MCP clients drop
         // annotation fields they do not know (Python _build_meta).
         private static IReadOnlyDictionary<string, object?>? BuildMeta(McpToolAnnotations? annotations)
@@ -125,53 +237,10 @@ public sealed class McpSdkServerBuilder
             return new Dictionary<string, object?> { ["anthropic/maxResultSizeChars"] = maxSize };
         }
 
-        public static ToolRegistration Create(string name, string? description, Delegate handler, McpToolAnnotations? annotations = null)
-        {
-            var plan = BindingPlan.Create(handler.Method);
-            var schema = plan.BuildInputSchema();
-            return new ToolRegistration(name, description, schema, handler, plan, annotations);
-        }
-
-        public async Task<McpToolResult> InvokeAsync(JsonElement args, CancellationToken ct)
-        {
-            var invokeArgs = _bindingPlan.BindArguments(args, ct);
-            object? result;
-            try
-            {
-                result = _handler.DynamicInvoke(invokeArgs);
-            }
-            catch (TargetInvocationException tie) when (tie.InnerException != null)
-            {
-                // Surface the handler's own exception (and message), not the reflection wrapper.
-                ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
-                throw;
-            }
-            var value = await AwaitIfNeededAsync(result).ConfigureAwait(false);
-            return ConvertToToolResult(value);
-        }
-
-        private static McpToolResult ConvertToToolResult(object? value)
-        {
-            switch (value)
-            {
-                case McpToolResult toolResult:
-                    return new McpToolResult { Content = ConvertContent(toolResult.Content), IsError = toolResult.IsError };
-                case McpContent content:
-                    return new McpToolResult { Content = ConvertContent([content]) };
-                case IEnumerable<McpContent> contents:
-                    return new McpToolResult { Content = ConvertContent(contents) };
-                case null:
-                    return McpToolResults.Text("");
-                case string s:
-                    return McpToolResults.Text(s);
-                case JsonElement je:
-                    return McpToolResults.Text(je.GetRawText());
-                default:
-                    if (IsSimpleScalar(value.GetType()))
-                        return McpToolResults.Text(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "");
-                    return McpToolResults.Text(JsonSerializer.Serialize(value, ToolJsonOptions));
-            }
-        }
+        /// <summary>Normalize a handler's result: content is converted as the CLI expects.</summary>
+        protected static McpToolResult Normalize(McpToolResult? result) => result == null
+            ? McpToolResults.Text("")
+            : new McpToolResult { Content = ConvertContent(result.Content), IsError = result.IsError };
 
         /// <summary>
         /// Map a handler's content to what the CLI renders (Python <c>_convert_tool_content</c>):
@@ -212,6 +281,104 @@ public sealed class McpSdkServerBuilder
             }
 
             return content;
+        }
+    }
+
+    /// <summary>A tool with an explicit schema and a JSON-arguments handler (AOT-safe).</summary>
+    private sealed class HandlerToolRegistration : ToolRegistration
+    {
+        private readonly Func<JsonElement, CancellationToken, Task<McpToolResult>> _handler;
+
+        public HandlerToolRegistration(
+            string name,
+            string? description,
+            JsonElement inputSchema,
+            Func<JsonElement, CancellationToken, Task<McpToolResult>> handler,
+            McpToolAnnotations? annotations)
+            : base(name, description, inputSchema, annotations)
+        {
+            _handler = handler;
+        }
+
+        public override async Task<McpToolResult> InvokeAsync(JsonElement args, CancellationToken ct)
+        {
+            // Match the delegate path: an absent/null arguments value binds as {}.
+            if (args.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null)
+                args = SdkJson.EmptyObject();
+            return Normalize(await _handler(args, ct).ConfigureAwait(false));
+        }
+    }
+
+    /// <summary>A tool whose schema and argument binding are inferred by reflection.</summary>
+    [RequiresUnreferencedCode(DelegateToolRequiresMessage)]
+    [RequiresDynamicCode(DelegateToolRequiresMessage)]
+    private sealed class DelegateToolRegistration : ToolRegistration
+    {
+        private static JsonSerializerOptions? s_toolJsonOptions;
+
+        private static JsonSerializerOptions ToolJsonOptions => s_toolJsonOptions ??= new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+            // The schema advertises enums by name, so bind (and report) them by name too.
+            Converters = { new JsonStringEnumConverter() }
+        };
+
+        private readonly Delegate _handler;
+        private readonly BindingPlan _bindingPlan;
+
+        private DelegateToolRegistration(string name, string? description, JsonElement inputSchema, Delegate handler, BindingPlan bindingPlan, McpToolAnnotations? annotations)
+            : base(name, description, inputSchema, annotations)
+        {
+            _handler = handler;
+            _bindingPlan = bindingPlan;
+        }
+
+        public static DelegateToolRegistration Create(string name, string? description, Delegate handler, McpToolAnnotations? annotations = null)
+        {
+            var plan = BindingPlan.Create(handler.Method);
+            var schema = plan.BuildInputSchema();
+            return new DelegateToolRegistration(name, description, schema, handler, plan, annotations);
+        }
+
+        public override async Task<McpToolResult> InvokeAsync(JsonElement args, CancellationToken ct)
+        {
+            var invokeArgs = _bindingPlan.BindArguments(args, ct);
+            object? result;
+            try
+            {
+                result = _handler.DynamicInvoke(invokeArgs);
+            }
+            catch (TargetInvocationException tie) when (tie.InnerException != null)
+            {
+                // Surface the handler's own exception (and message), not the reflection wrapper.
+                ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+                throw;
+            }
+            var value = await AwaitIfNeededAsync(result).ConfigureAwait(false);
+            return ConvertToToolResult(value);
+        }
+
+        private static McpToolResult ConvertToToolResult(object? value)
+        {
+            switch (value)
+            {
+                case McpToolResult toolResult:
+                    return Normalize(toolResult);
+                case McpContent content:
+                    return new McpToolResult { Content = ConvertContent([content]) };
+                case IEnumerable<McpContent> contents:
+                    return new McpToolResult { Content = ConvertContent(contents) };
+                case null:
+                    return McpToolResults.Text("");
+                case string s:
+                    return McpToolResults.Text(s);
+                case JsonElement je:
+                    return McpToolResults.Text(je.GetRawText());
+                default:
+                    if (IsSimpleScalar(value.GetType()))
+                        return McpToolResults.Text(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "");
+                    return McpToolResults.Text(JsonSerializer.Serialize(value, ToolJsonOptions));
+            }
         }
 
         private static bool IsSimpleScalar(Type type)
@@ -266,6 +433,8 @@ public sealed class McpSdkServerBuilder
             return result;
         }
 
+        [RequiresUnreferencedCode(DelegateToolRequiresMessage)]
+        [RequiresDynamicCode(DelegateToolRequiresMessage)]
         private sealed class BindingPlan
         {
             private readonly List<BindingParameter> _parameters;
@@ -489,6 +658,8 @@ public sealed class McpSdkServerBuilder
             }
         }
 
+        [RequiresUnreferencedCode(DelegateToolRequiresMessage)]
+        [RequiresDynamicCode(DelegateToolRequiresMessage)]
         private sealed class BindingParameter
         {
             public string JsonName { get; }
@@ -531,6 +702,8 @@ public sealed class McpSdkServerBuilder
     /// (<c>{"type": ["integer", "null"]}</c>): the model often sends null for an optional
     /// argument, and the handler can accept it.
     /// </remarks>
+    [RequiresUnreferencedCode(DelegateToolRequiresMessage)]
+    [RequiresDynamicCode(DelegateToolRequiresMessage)]
     internal static class McpSchemaGenerator
     {
         // Beyond this nesting the schema is truncated to a permissive one (keeping the JSON well

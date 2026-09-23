@@ -106,7 +106,7 @@ internal class QueryHandler : IAsyncDisposable
             ["uuid"] = Guid.NewGuid().ToString(),
             ["session_id"] = key?.SessionId ?? ""
         };
-        if (!_messageChannel.Writer.TryWrite(JsonSerializer.SerializeToElement(msg)))
+        if (!_messageChannel.Writer.TryWrite(SdkJson.SerializeToElement(msg)))
             System.Diagnostics.Debug.WriteLine($"[QueryHandler] Dropping mirror_error message (buffer full): {error}");
     }
 
@@ -399,7 +399,7 @@ internal class QueryHandler : IAsyncDisposable
         try
         {
             var filePath = message.GetProperty("filePath").GetString()!;
-            var entries = JsonSerializer.Deserialize<List<SessionStoreEntry>>(message.GetProperty("entries").GetRawText())
+            var entries = message.GetProperty("entries").Deserialize(SdkJsonContext.Default.ListSessionStoreEntry)
                 ?? [];
             _transcriptMirrorBatcher!.Enqueue(filePath, entries);
         }
@@ -504,7 +504,7 @@ internal class QueryHandler : IAsyncDisposable
                     var payload = response.TryGetProperty("response", out var inner) &&
                                   inner.ValueKind == JsonValueKind.Object
                         ? inner.Clone()
-                        : JsonSerializer.SerializeToElement(new Dictionary<string, object?>());
+                        : SdkJson.EmptyObject();
                     tcs.TrySetResult(payload);
                 }
             }
@@ -547,20 +547,20 @@ internal class QueryHandler : IAsyncDisposable
             }
 
             // Send success response
-            var successResponse = new
+            var successResponse = new Dictionary<string, object?>
             {
-                type = "control_response",
-                response = new
+                ["type"] = "control_response",
+                ["response"] = new Dictionary<string, object?>
                 {
-                    subtype = "success",
-                    request_id = requestId,
-                    response = responseData
+                    ["subtype"] = "success",
+                    ["request_id"] = requestId,
+                    ["response"] = responseData
                 }
             };
 
             // Write with a token that outlives the request: cancelling mid-write
             // would mark the transport broken for every later write.
-            await _transport.WriteAsync(JsonSerializer.Serialize(successResponse) + "\n", CancellationToken.None);
+            await _transport.WriteAsync(SdkJson.Serialize(successResponse) + "\n", CancellationToken.None);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -570,20 +570,20 @@ internal class QueryHandler : IAsyncDisposable
         catch (Exception ex)
         {
             // Send error response
-            var errorResponse = new
+            var errorResponse = new Dictionary<string, object?>
             {
-                type = "control_response",
-                response = new
+                ["type"] = "control_response",
+                ["response"] = new Dictionary<string, object?>
                 {
-                    subtype = "error",
-                    request_id = requestId,
-                    error = ex.Message
+                    ["subtype"] = "error",
+                    ["request_id"] = requestId,
+                    ["error"] = ex.Message
                 }
             };
 
             try
             {
-                await _transport.WriteAsync(JsonSerializer.Serialize(errorResponse) + "\n", CancellationToken.None);
+                await _transport.WriteAsync(SdkJson.Serialize(errorResponse) + "\n", CancellationToken.None);
             }
             catch (Exception writeEx)
             {
@@ -629,8 +629,8 @@ internal class QueryHandler : IAsyncDisposable
             {
                 ["behavior"] = "allow",
                 ["updatedInput"] = allow.UpdatedInput.HasValue
-                    ? JsonSerializer.Deserialize<object>(allow.UpdatedInput.Value.GetRawText())
-                    : JsonSerializer.Deserialize<object>(input.GetRawText())
+                    ? allow.UpdatedInput.Value.Clone()
+                    : input.Clone()
             };
 
             if (allow.UpdatedPermissions != null)
@@ -688,7 +688,7 @@ internal class QueryHandler : IAsyncDisposable
         if (output.Reason != null)
             result["reason"] = output.Reason;
         if (output.HookSpecificOutput.HasValue)
-            result["hookSpecificOutput"] = JsonSerializer.Deserialize<object>(output.HookSpecificOutput.Value.GetRawText());
+            result["hookSpecificOutput"] = output.HookSpecificOutput.Value.Clone();
         if (output.Async.HasValue)
             result["async"] = output.Async.Value;
         if (output.AsyncTimeout.HasValue)
@@ -699,52 +699,70 @@ internal class QueryHandler : IAsyncDisposable
 
     private async Task<object> HandleMcpMessageAsync(JsonElement request, CancellationToken cancellationToken)
     {
-        var serverName = request.GetProperty("server_name").GetString()!;
-        var message = request.GetProperty("message");
+        // Python: _handle_control_request, mcp_message branch.
+        var serverName = request.TryGetProperty("server_name", out var sn) && sn.ValueKind == JsonValueKind.String
+            ? sn.GetString()
+            : null;
+        var hasMessage = request.TryGetProperty("message", out var message) &&
+                         message.ValueKind == JsonValueKind.Object &&
+                         message.EnumerateObject().Any();
+        if (string.IsNullOrEmpty(serverName) || !hasMessage)
+            throw new ClaudeSDKException("Missing server_name or message for MCP request");
+
+        // JSON-RPC notifications get no reply, but the control request that
+        // carried one still expects an ack.
+        var mcpResponse = await HandleSdkMcpRequestAsync(serverName, message, cancellationToken)
+                          ?? SdkJson.ParseElement("""{"jsonrpc":"2.0","result":{}}""");
+        return new Dictionary<string, object?> { ["mcp_response"] = mcpResponse };
+    }
+
+    /// <summary>
+    /// Route a JSON-RPC message to the named SDK MCP server. Returns the
+    /// JSON-RPC response for requests, or null for notifications and
+    /// responses (which expect no reply). A message that cannot be delivered
+    /// is answered with a JSON-RPC error. Python: <c>_handle_sdk_mcp_request</c>.
+    /// </summary>
+    private async Task<JsonElement?> HandleSdkMcpRequestAsync(
+        string serverName, JsonElement message, CancellationToken cancellationToken)
+    {
+        object? MessageId() => message.TryGetProperty("id", out var id) ? id.Clone() : null;
 
         if (!_sdkMcpBridges.TryGetValue(serverName, out var bridge))
         {
-            // Return JSONRPC error for unknown server wrapped in mcp_response
-            return new Dictionary<string, object?>
+            return SdkJson.SerializeToElement(new Dictionary<string, object?>
             {
-                ["mcp_response"] = new Dictionary<string, object?>
+                ["jsonrpc"] = "2.0",
+                ["id"] = MessageId(),
+                ["error"] = new Dictionary<string, object?>
                 {
-                    ["jsonrpc"] = "2.0",
-                    ["id"] = message.TryGetProperty("id", out var id) ? id.Clone() : null,
-                    ["error"] = new Dictionary<string, object?>
-                    {
-                        ["code"] = -32601,
-                        ["message"] = $"SDK MCP server '{serverName}' not found"
-                    }
+                    ["code"] = -32601,
+                    ["message"] = $"Server '{serverName}' not found"
                 }
-            };
+            });
         }
 
         try
         {
-            var response = await bridge.SendMessageAsync(message, cancellationToken);
-            // Wrap the MCP response as expected by the control protocol
-            return new Dictionary<string, object?>
-            {
-                ["mcp_response"] = JsonSerializer.Deserialize<object>(response.GetRawText())
-            };
+            return await bridge.HandleAsync(message, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The control request was cancelled; no response is written.
+            throw;
         }
         catch (Exception ex)
         {
-            // Return JSONRPC error wrapped in mcp_response
-            return new Dictionary<string, object?>
+            return SdkJson.SerializeToElement(new Dictionary<string, object?>
             {
-                ["mcp_response"] = new Dictionary<string, object?>
+                ["jsonrpc"] = "2.0",
+                ["id"] = MessageId(),
+                ["error"] = new Dictionary<string, object?>
                 {
-                    ["jsonrpc"] = "2.0",
-                    ["id"] = message.TryGetProperty("id", out var id) ? id.Clone() : null,
-                    ["error"] = new Dictionary<string, object?>
-                    {
-                        ["code"] = -32603,
-                        ["message"] = $"MCP server error: {ex.Message}"
-                    }
+                    ["code"] = -32603,
+                    // Python: str(e) or type(e).__name__
+                    ["message"] = string.IsNullOrEmpty(ex.Message) ? ex.GetType().Name : ex.Message
                 }
-            };
+            });
         }
     }
 
@@ -759,7 +777,7 @@ internal class QueryHandler : IAsyncDisposable
     }
 
     private async Task<JsonElement> SendControlRequestAsync(
-        object request,
+        Dictionary<string, object?> request,
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
@@ -776,14 +794,14 @@ internal class QueryHandler : IAsyncDisposable
             _lock.Release();
         }
 
-        var controlRequest = new
+        var controlRequest = new Dictionary<string, object?>
         {
-            type = "control_request",
-            request_id = requestId,
-            request
+            ["type"] = "control_request",
+            ["request_id"] = requestId,
+            ["request"] = request
         };
 
-        await _transport.WriteAsync(JsonSerializer.Serialize(controlRequest) + "\n", cancellationToken);
+        await _transport.WriteAsync(SdkJson.Serialize(controlRequest) + "\n", cancellationToken);
 
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(timeout);
@@ -794,7 +812,7 @@ internal class QueryHandler : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            throw new ClaudeSDKException($"Control request timeout: {request}");
+            throw new ClaudeSDKException($"Control request timeout: {request.GetValueOrDefault("subtype")}");
         }
         finally
         {
@@ -816,7 +834,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task InterruptAsync(CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "interrupt" },
+            new Dictionary<string, object?> { ["subtype"] = "interrupt" },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -828,7 +846,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task SetPermissionModeAsync(string mode, CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "set_permission_mode", mode },
+            new Dictionary<string, object?> { ["subtype"] = "set_permission_mode", ["mode"] = mode },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -840,7 +858,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task SetModelAsync(string? model, CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "set_model", model },
+            new Dictionary<string, object?> { ["subtype"] = "set_model", ["model"] = model },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -852,7 +870,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task RewindFilesAsync(string userMessageId, CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "rewind_files", user_message_id = userMessageId },
+            new Dictionary<string, object?> { ["subtype"] = "rewind_files", ["user_message_id"] = userMessageId },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -864,7 +882,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task<JsonElement> GetMcpStatusAsync(CancellationToken cancellationToken = default)
     {
         return await SendControlRequestAsync(
-            new { subtype = "mcp_status" },
+            new Dictionary<string, object?> { ["subtype"] = "mcp_status" },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -876,7 +894,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task<JsonElement> GetContextUsageAsync(CancellationToken cancellationToken = default)
     {
         return await SendControlRequestAsync(
-            new { subtype = "get_context_usage" },
+            new Dictionary<string, object?> { ["subtype"] = "get_context_usage" },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -886,7 +904,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task ReconnectMcpServerAsync(string serverName, CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "mcp_reconnect", serverName },
+            new Dictionary<string, object?> { ["subtype"] = "mcp_reconnect", ["serverName"] = serverName },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -896,7 +914,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task ToggleMcpServerAsync(string serverName, bool enabled, CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "mcp_toggle", serverName, enabled },
+            new Dictionary<string, object?> { ["subtype"] = "mcp_toggle", ["serverName"] = serverName, ["enabled"] = enabled },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -906,7 +924,7 @@ internal class QueryHandler : IAsyncDisposable
     public async Task StopTaskAsync(string taskId, CancellationToken cancellationToken = default)
     {
         await SendControlRequestAsync(
-            new { subtype = "stop_task", task_id = taskId },
+            new Dictionary<string, object?> { ["subtype"] = "stop_task", ["task_id"] = taskId },
             TimeSpan.FromSeconds(60),
             cancellationToken
         );
@@ -968,7 +986,7 @@ internal class QueryHandler : IAsyncDisposable
                 if (_closed)
                     break;
                 await _transport.WriteAsync(
-                    JsonSerializer.Serialize(StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
+                    SdkJson.Serialize(StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
                     cancellationToken);
                 written++;
             }

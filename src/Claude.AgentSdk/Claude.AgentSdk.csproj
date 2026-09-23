@@ -34,8 +34,10 @@
     <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
 
     <!-- AOT/Trimming -->
-    <!-- This library currently uses dynamic JSON (Dictionary/object/anonymous types) in the control protocol and MCP bridge paths.
-         NativeAOT and aggressive trimming are not guaranteed until those paths are made source-gen friendly. -->
+    <!-- Enables the trim, single-file and AOT analyzers; the build must stay free of IL2xxx/IL3xxx warnings.
+         Reflection-only APIs (McpSdkServerBuilder.Tool(string, Delegate, ...)) are annotated and have AOT-safe
+         alternatives. tests/Claude.AgentSdk.AotSmoke publishes a NativeAOT app against this library. -->
+    <IsAotCompatible>true</IsAotCompatible>
 
     <!-- SourceLink for debugging -->
     <PublishRepositoryUrl>true</PublishRepositoryUrl>

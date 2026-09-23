@@ -59,6 +59,7 @@ internal static class TaskCompat
     /// </summary>
     public static bool OverridesMethod(
         object instance,
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.NonPublicMethods)]
         Type declaringType,
         string methodName)
     {
@@ -82,6 +83,12 @@ internal static class TaskCompat
         catch (ArgumentException)
         {
             // Type does not implement the interface explicitly — fall through.
+        }
+        catch (NotSupportedException)
+        {
+            // Interface maps unavailable on this runtime: assume implemented; an
+            // unimplemented optional method still fails later with NotImplementedException.
+            return true;
         }
         return false;
     }

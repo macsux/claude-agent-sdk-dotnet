@@ -4,6 +4,7 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Claude.AgentSdk.Internal;
 
 namespace Claude.AgentSdk.Mcp;
 
@@ -353,12 +354,23 @@ internal class SdkMcpBridge : IAsyncDisposable
     }
 
     /// <summary>
-    /// Send a JSONRPC message to the MCP server and get the response.
+    /// Send a JSONRPC message to the MCP server and get the response. Notifications and
+    /// responses (which expect no reply) are answered with an empty-result ack.
     /// </summary>
     /// <param name="message">The JSONRPC request message.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>The JSONRPC response from the server.</returns>
     public async Task<JsonElement> SendMessageAsync(
+        JsonElement message,
+        CancellationToken cancellationToken = default)
+        => await HandleAsync(message, cancellationToken).ConfigureAwait(false) ?? Ack();
+
+    /// <summary>
+    /// Handle one JSON-RPC message from the CLI. Returns the JSON-RPC response for
+    /// requests, and <c>null</c> for notifications and responses, which expect no reply.
+    /// Python: <c>SdkMcpBridge.handle</c>.
+    /// </summary>
+    public async Task<JsonElement?> HandleAsync(
         JsonElement message,
         CancellationToken cancellationToken = default)
     {
@@ -374,13 +386,13 @@ internal class SdkMcpBridge : IAsyncDisposable
         var id = hasId ? message.GetProperty("id").Clone() : default;
         var paramsEl = message.ValueKind == JsonValueKind.Object && message.TryGetProperty("params", out var p) ? p : default;
 
-        // Notifications (no id) and responses expect no reply; the control request that
-        // carried one still gets an ack (Python: {"jsonrpc": "2.0", "result": {}}).
+        // Notifications (no id) and responses expect no reply; the caller acks the
+        // control request that carried one (Python: {"jsonrpc": "2.0", "result": {}}).
         if (!hasId)
         {
             if (method == "notifications/cancelled")
                 CancelInFlight(paramsEl);
-            return Ack();
+            return null;
         }
 
         if (method == null)
@@ -425,7 +437,7 @@ internal class SdkMcpBridge : IAsyncDisposable
             if (request.CancelledByClient)
                 return Error(id, RequestCancelled, "Request cancelled");
 
-            return JsonSerializer.SerializeToElement(new Dictionary<string, object?>
+            return SdkJson.SerializeToElement(new Dictionary<string, object?>
             {
                 ["jsonrpc"] = "2.0",
                 ["id"] = id,
@@ -441,7 +453,7 @@ internal class SdkMcpBridge : IAsyncDisposable
     private Task<object> DispatchAsync(string method, JsonElement paramsEl, CancellationToken ct) => method switch
     {
         "initialize" => Task.FromResult(HandleInitialize()),
-        "ping" => Task.FromResult<object>(new Dictionary<string, object?>()),
+        "ping" => Task.FromResult<object>(SdkJson.EmptyObject()),
         "tools/list" => HandleToolsListAsync(ct),
         "tools/call" => HandleToolsCallAsync(paramsEl, ct),
         "prompts/list" => HandlePromptsListAsync(ct),
@@ -461,13 +473,9 @@ internal class SdkMcpBridge : IAsyncDisposable
             request.CancelByClient();
     }
 
-    private static JsonElement Ack() => JsonSerializer.SerializeToElement(new Dictionary<string, object?>
-    {
-        ["jsonrpc"] = "2.0",
-        ["result"] = new Dictionary<string, object?>()
-    });
+    private static JsonElement Ack() => SdkJson.ParseElement("""{"jsonrpc":"2.0","result":{}}""");
 
-    private static JsonElement Error(JsonElement id, int code, string message) => JsonSerializer.SerializeToElement(new Dictionary<string, object?>
+    private static JsonElement Error(JsonElement id, int code, string message) => SdkJson.SerializeToElement(new Dictionary<string, object?>
     {
         ["jsonrpc"] = "2.0",
         ["id"] = id.ValueKind != JsonValueKind.Undefined ? id : null,
@@ -477,22 +485,22 @@ internal class SdkMcpBridge : IAsyncDisposable
     private object HandleInitialize()
     {
         // Build capabilities dynamically - only include supported capabilities
-        var capabilities = new Dictionary<string, object>();
+        var capabilities = new Dictionary<string, object?>();
         if (_handlers.ListTools != null)
-            capabilities["tools"] = new { };
+            capabilities["tools"] = new Dictionary<string, object?>();
         if (_handlers.ListPrompts != null)
-            capabilities["prompts"] = new { };
+            capabilities["prompts"] = new Dictionary<string, object?>();
         if (_handlers.ListResources != null)
-            capabilities["resources"] = new { };
+            capabilities["resources"] = new Dictionary<string, object?>();
 
-        return new
+        return new Dictionary<string, object?>
         {
-            protocolVersion = "2024-11-05",
-            capabilities,
-            serverInfo = new
+            ["protocolVersion"] = "2024-11-05",
+            ["capabilities"] = capabilities,
+            ["serverInfo"] = new Dictionary<string, object?>
             {
-                name = _serverName,
-                version = "1.0.0"
+                ["name"] = _serverName,
+                ["version"] = "1.0.0"
             }
         };
     }
@@ -506,7 +514,7 @@ internal class SdkMcpBridge : IAsyncDisposable
             throw new MethodNotFoundException();
 
         var tools = await _handlers.ListTools(ct);
-        return new { tools };
+        return new Dictionary<string, object?> { ["tools"] = tools?.Select(ToolDefinitionToWire).ToList() };
     }
 
     private async Task<object> HandleToolsCallAsync(JsonElement paramsEl, CancellationToken ct)
@@ -517,7 +525,7 @@ internal class SdkMcpBridge : IAsyncDisposable
         var name = paramsEl.GetProperty("name").GetString()!;
         var arguments = paramsEl.TryGetProperty("arguments", out var args) && args.ValueKind != JsonValueKind.Null
             ? args
-            : JsonSerializer.SerializeToElement(new { });
+            : SdkJson.EmptyObject();
 
         var result = await _handlers.CallTool(name, arguments, ct);
         return result;
@@ -529,7 +537,7 @@ internal class SdkMcpBridge : IAsyncDisposable
             throw new MethodNotFoundException();
 
         var prompts = await _handlers.ListPrompts(ct);
-        return new { prompts };
+        return new Dictionary<string, object?> { ["prompts"] = prompts };
     }
 
     private async Task<object> HandlePromptsGetAsync(JsonElement paramsEl, CancellationToken ct)
@@ -539,7 +547,7 @@ internal class SdkMcpBridge : IAsyncDisposable
 
         var name = paramsEl.GetProperty("name").GetString()!;
         var arguments = paramsEl.TryGetProperty("arguments", out var args) && args.ValueKind != JsonValueKind.Null
-            ? JsonSerializer.Deserialize<Dictionary<string, string>>(args.GetRawText())
+            ? args.Deserialize(SdkJsonContext.Default.DictionaryStringString)
             : null;
 
         var result = await _handlers.GetPrompt(name, arguments, ct);
@@ -552,7 +560,7 @@ internal class SdkMcpBridge : IAsyncDisposable
             throw new MethodNotFoundException();
 
         var resources = await _handlers.ListResources(ct);
-        return new { resources };
+        return new Dictionary<string, object?> { ["resources"] = resources };
     }
 
     private async Task<object> HandleResourcesReadAsync(JsonElement paramsEl, CancellationToken ct)
@@ -563,6 +571,24 @@ internal class SdkMcpBridge : IAsyncDisposable
         var uri = paramsEl.GetProperty("uri").GetString()!;
         var result = await _handlers.ReadResource(uri, ct);
         return result;
+    }
+
+    /// <summary>
+    /// Wire form of a tool definition. Written by hand (rather than with a serializer
+    /// contract) because <see cref="McpToolDefinition.Meta"/> holds arbitrary values.
+    /// </summary>
+    private static Dictionary<string, object?> ToolDefinitionToWire(McpToolDefinition tool)
+    {
+        var wire = new Dictionary<string, object?> { ["name"] = tool.Name };
+        if (tool.Description != null)
+            wire["description"] = tool.Description;
+        if (tool.InputSchema is { } schema)
+            wire["inputSchema"] = schema;
+        if (tool.Annotations != null)
+            wire["annotations"] = tool.Annotations;
+        if (tool.Meta != null)
+            wire["_meta"] = tool.Meta;
+        return wire;
     }
 
     /// <summary>

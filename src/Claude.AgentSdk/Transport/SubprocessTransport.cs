@@ -7,6 +7,7 @@ using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using Claude.AgentSdk.Internal;
 
 namespace Claude.AgentSdk.Transport;
 
@@ -433,7 +434,7 @@ public class SubprocessTransport : ITransport
             {
                 try
                 {
-                    var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(settingsStr);
+                    var parsed = ParseSettingsObject(settingsStr);
                     if (parsed != null)
                         settingsObj = parsed;
                 }
@@ -443,7 +444,7 @@ public class SubprocessTransport : ITransport
                     if (File.Exists(settingsStr))
                     {
                         var content = File.ReadAllText(settingsStr);
-                        var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(content);
+                        var parsed = ParseSettingsObject(content);
                         if (parsed != null)
                             settingsObj = parsed;
                     }
@@ -452,7 +453,7 @@ public class SubprocessTransport : ITransport
             else if (File.Exists(settingsStr))
             {
                 var content = File.ReadAllText(settingsStr);
-                var parsed = JsonSerializer.Deserialize<Dictionary<string, object?>>(content);
+                var parsed = ParseSettingsObject(content);
                 if (parsed != null)
                     settingsObj = parsed;
             }
@@ -461,7 +462,13 @@ public class SubprocessTransport : ITransport
         if (hasSandbox)
             settingsObj["sandbox"] = _options.Sandbox;
 
-        return JsonSerializer.Serialize(settingsObj);
+        return SdkJson.Serialize(settingsObj);
+    }
+
+    private static Dictionary<string, object?>? ParseSettingsObject(string json)
+    {
+        var parsed = JsonSerializer.Deserialize(json, SdkJsonContext.Default.DictionaryStringJsonElement);
+        return parsed?.ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
     }
 
     internal List<string> BuildCommand()
@@ -599,8 +606,8 @@ public class SubprocessTransport : ITransport
                         serversForCli[name] = config;
                     }
                 }
-                var mcpConfig = new { mcpServers = serversForCli };
-                cmd.AddRange(["--mcp-config", JsonSerializer.Serialize(mcpConfig)]);
+                var mcpConfig = new Dictionary<string, object?> { ["mcpServers"] = serversForCli };
+                cmd.AddRange(["--mcp-config", SdkJson.Serialize(mcpConfig)]);
                 break;
             }
             case McpServersConfig.ConfigPath { Value.Length: > 0 } path:
@@ -983,7 +990,7 @@ public class SubprocessTransport : ITransport
 
         try
         {
-            return JsonSerializer.Deserialize<JsonElement>(line);
+            return JsonSerializer.Deserialize(line, SdkJsonContext.Default.JsonElement);
         }
         catch (JsonException ex)
         {

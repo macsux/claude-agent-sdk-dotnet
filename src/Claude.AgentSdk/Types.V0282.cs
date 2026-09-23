@@ -281,7 +281,7 @@ internal static class McpEnumHelpers
 }
 
 /// <summary>Server info from MCP initialize handshake. Python commit 28f9b4b.
-/// Named "Status" to disambiguate from <see cref="Claude.AgentSdk.Mcp"/>'s
+/// Named "Status" to disambiguate from <c>Claude.AgentSdk.Mcp</c>'s
 /// in-process MCP server types.</summary>
 public record McpStatusServerInfo(
     [property: JsonPropertyName("name")] string Name,
@@ -289,7 +289,7 @@ public record McpStatusServerInfo(
 );
 
 /// <summary>Tool annotations as returned in MCP server status. Python commit 28f9b4b.
-/// Named "Status" to disambiguate from <see cref="Claude.AgentSdk.Mcp"/>'s
+/// Named "Status" to disambiguate from <c>Claude.AgentSdk.Mcp</c>'s
 /// in-process MCP server <c>McpToolAnnotations</c>.</summary>
 public record McpStatusToolAnnotations
 {
@@ -304,7 +304,7 @@ public record McpStatusToolAnnotations
 }
 
 /// <summary>Information about a tool provided by an MCP server. Python commit 28f9b4b.
-/// Named "Status" to disambiguate from <see cref="Claude.AgentSdk.Mcp"/>'s
+/// Named "Status" to disambiguate from <c>Claude.AgentSdk.Mcp</c>'s
 /// in-process MCP server <c>McpToolDefinition</c>.</summary>
 public record McpStatusToolInfo
 {
@@ -356,8 +356,9 @@ public record McpServerStatusConfig
     public required string Type { get; init; }
 
     /// <summary>Full raw config payload — opaque structural supertype.</summary>
+    // `set`, not `init`: source-generated (AOT) metadata cannot bind extension data through an initializer.
     [JsonExtensionData]
-    public Dictionary<string, JsonElement>? Extras { get; init; }
+    public Dictionary<string, JsonElement>? Extras { get; set; }
 }
 
 /// <summary>Status information for an MCP server connection. Python commit 28f9b4b.</summary>

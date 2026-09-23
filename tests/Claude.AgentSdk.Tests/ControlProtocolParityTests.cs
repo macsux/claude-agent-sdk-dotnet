@@ -345,4 +345,82 @@ public sealed class MessageParserForwardCompatTests
         var msg = Assert.IsType<TaskNotificationMessage>(MessageParser.Parse(json));
         Assert.Equal(expected, msg.Status);
     }
+
+    private static async Task<QueryHandler> StartHandlerAsync(FakeTransport transport, ClaudeAgentOptions options)
+    {
+        var handler = new QueryHandler(transport, options);
+        await handler.StartAsync();
+        await handler.InitializeAsync();
+        return handler;
+    }
+
+    private static async Task<JsonElement> SendMcpMessageAsync(FakeTransport transport, string requestId, object request)
+    {
+        transport.Send(new { type = "control_request", request_id = requestId, request });
+        await transport.WaitForAsync(t => t.Written.Any(w =>
+            w.GetProperty("type").GetString() == "control_response" &&
+            w.GetProperty("response").GetProperty("request_id").GetString() == requestId));
+        return transport.Written.Single(w =>
+            w.GetProperty("type").GetString() == "control_response" &&
+            w.GetProperty("response").GetProperty("request_id").GetString() == requestId).GetProperty("response");
+    }
+
+    [Fact]
+    public async Task McpMessage_UnknownServer_UsesPythonErrorText()
+    {
+        var transport = new FakeTransport();
+        await using var handler = await StartHandlerAsync(transport, new ClaudeAgentOptions());
+
+        var response = await SendMcpMessageAsync(transport, "mcp-1", new
+        {
+            subtype = "mcp_message",
+            server_name = "nope",
+            message = new { jsonrpc = "2.0", id = 7, method = "tools/list" }
+        });
+
+        Assert.Equal("success", response.GetProperty("subtype").GetString());
+        var mcp = response.GetProperty("response").GetProperty("mcp_response");
+        Assert.Equal(7, mcp.GetProperty("id").GetInt32());
+        Assert.Equal(-32601, mcp.GetProperty("error").GetProperty("code").GetInt32());
+        Assert.Equal("Server 'nope' not found", mcp.GetProperty("error").GetProperty("message").GetString());
+    }
+
+    [Fact]
+    public async Task McpMessage_Notification_IsAckedWithEmptyResult()
+    {
+        var transport = new FakeTransport();
+        await using var handler = await StartHandlerAsync(transport, new ClaudeAgentOptions());
+        handler.RegisterSdkMcpBridge("srv", new Mcp.SdkMcpBridge(new Mcp.McpServerHandlers(), "srv"));
+
+        var response = await SendMcpMessageAsync(transport, "mcp-2", new
+        {
+            subtype = "mcp_message",
+            server_name = "srv",
+            message = new { jsonrpc = "2.0", method = "notifications/initialized" }
+        });
+
+        Assert.Equal(
+            """{"jsonrpc":"2.0","result":{}}""",
+            response.GetProperty("response").GetProperty("mcp_response").GetRawText());
+    }
+
+    [Fact]
+    public async Task McpMessage_MissingMessage_IsAControlError()
+    {
+        var transport = new FakeTransport();
+        await using var handler = await StartHandlerAsync(transport, new ClaudeAgentOptions());
+
+        var response = await SendMcpMessageAsync(transport, "mcp-3", new { subtype = "mcp_message", server_name = "srv" });
+
+        Assert.Equal("error", response.GetProperty("subtype").GetString());
+        Assert.Equal("Missing server_name or message for MCP request", response.GetProperty("error").GetString());
+    }
+
+    [Fact]
+    public async Task SdkMcpBridge_HandleAsync_ReturnsNullForNotifications()
+    {
+        var bridge = new Mcp.SdkMcpBridge(new Mcp.McpServerHandlers(), "srv");
+        var reply = await bridge.HandleAsync(JsonSerializer.SerializeToElement(new { jsonrpc = "2.0", method = "notifications/initialized" }));
+        Assert.Null(reply);
+    }
 }

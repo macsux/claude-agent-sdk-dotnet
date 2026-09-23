@@ -2,6 +2,7 @@
 // Reference: reference/claude-agent-sdk-python/src/claude_agent_sdk/_internal/transcript_mirror_batcher.py
 
 using System.Text.Json;
+using Claude.AgentSdk.Internal;
 using System.Threading.Channels;
 
 namespace Claude.AgentSdk.Sessions;
@@ -264,7 +265,7 @@ public sealed class TranscriptMirrorBatcher : IAsyncDisposable
     {
         try
         {
-            return JsonSerializer.Serialize(entries).Length;
+            return JsonSerializer.Serialize(entries, SdkJsonContext.Default.IReadOnlyListSessionStoreEntry).Length;
         }
         catch
         {

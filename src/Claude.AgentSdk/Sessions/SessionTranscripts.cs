@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using Claude.AgentSdk.Internal;
 using System.Text.Json.Nodes;
 
 namespace Claude.AgentSdk.Sessions;
@@ -41,7 +42,7 @@ internal static class SessionTranscripts
         if (!raw.Contains('\\')) return raw;
         try
         {
-            return JsonSerializer.Deserialize<string>("\"" + raw + "\"") ?? raw;
+            return JsonSerializer.Deserialize("\"" + raw + "\"", SdkJsonContext.Default.String) ?? raw;
         }
         catch (JsonException)
         {

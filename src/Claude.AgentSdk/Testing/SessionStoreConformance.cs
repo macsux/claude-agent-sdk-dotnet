@@ -2,6 +2,7 @@
 // Reference: reference/claude-agent-sdk-python/src/claude_agent_sdk/testing/session_store_conformance.py
 
 using System.Text.Json;
+using Claude.AgentSdk.Internal;
 using System.Text.Json.Nodes;
 using Claude.AgentSdk.Sessions;
 
@@ -20,7 +21,7 @@ public sealed class ConformanceResult
     public List<(string Contract, string Message)> Failures { get; } = new();
 
     /// <summary>Names of optional contracts skipped (either via
-    /// <paramref name="skipOptional"/> in <see cref="SessionStoreConformance.RunAsync"/>
+    /// <c>skipOptional</c> in <see cref="SessionStoreConformance.RunAsync"/>
     /// or because the store does not override the optional method).</summary>
     public List<string> Skipped { get; } = new();
 
@@ -46,7 +47,7 @@ public sealed class ConformanceResult
 /// behavioral contracts every adapter must satisfy. Tests for optional
 /// methods (<c>list_sessions</c>, <c>list_session_summaries</c>,
 /// <c>delete</c>, <c>list_subkeys</c>) are skipped when named in
-/// <paramref name="skipOptional"/> or when the store does not override
+/// <c>skipOptional</c> or when the store does not override
 /// that method.
 /// </summary>
 public static class SessionStoreConformance
@@ -73,6 +74,7 @@ public static class SessionStoreConformance
     /// </summary>
     /// <param name="makeStore">Async factory producing a fresh store per contract.</param>
     /// <param name="skipOptional">Optional method names to skip entirely.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
     public static async Task<ConformanceResult> RunAsync(
         Func<Task<ISessionStore>> makeStore,
         ISet<string>? skipOptional = null,
@@ -397,7 +399,7 @@ public static class SessionStoreConformance
             Type = "x",
             Extras = new Dictionary<string, JsonElement>
             {
-                [field] = JsonDocument.Parse(JsonSerializer.Serialize(v)).RootElement.Clone(),
+                [field] = JsonDocument.Parse(JsonSerializer.Serialize(v, SdkJsonContext.Default.String)).RootElement.Clone(),
             },
         };
 
@@ -411,7 +413,7 @@ public static class SessionStoreConformance
             Timestamp = timestamp,
             Extras = new Dictionary<string, JsonElement>
             {
-                ["customTitle"] = JsonDocument.Parse(JsonSerializer.Serialize(customTitle)).RootElement.Clone(),
+                ["customTitle"] = JsonDocument.Parse(JsonSerializer.Serialize(customTitle, SdkJsonContext.Default.String)).RootElement.Clone(),
             },
         };
 

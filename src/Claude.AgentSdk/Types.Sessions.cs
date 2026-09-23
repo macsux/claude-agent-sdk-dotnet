@@ -45,8 +45,9 @@ public record SessionStoreEntry
     public string? Timestamp { get; init; }
 
     /// <summary>All other fields (opaque JSON pass-through).</summary>
+    // `set`, not `init`: source-generated (AOT) metadata cannot bind extension data through an initializer.
     [JsonExtensionData]
-    public Dictionary<string, JsonElement>? Extras { get; init; }
+    public Dictionary<string, JsonElement>? Extras { get; set; }
 }
 
 /// <summary>Entry returned by <see cref="ISessionStore.ListSessionsAsync"/>.</summary>

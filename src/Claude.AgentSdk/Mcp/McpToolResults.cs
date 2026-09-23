@@ -40,7 +40,7 @@ public static class McpContents
         return new McpContent
         {
             Type = "image",
-            Data = JsonSerializer.SerializeToElement(data),
+            Data = JsonSerializer.SerializeToElement(data, Internal.SdkJsonContext.Default.String),
             MimeType = mimeType
         };
     }

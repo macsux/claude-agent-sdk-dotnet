@@ -9,6 +9,7 @@
 
 using System.Text;
 using System.Text.Json;
+using Claude.AgentSdk.Internal;
 using System.Text.Json.Nodes;
 
 namespace Claude.AgentSdk.Sessions;
@@ -247,7 +248,7 @@ public sealed class FileSessionStore : ISessionStore
             try
             {
                 var text = File.ReadAllText(file, Encoding.UTF8);
-                var summ = JsonSerializer.Deserialize<SessionSummaryEntry>(text);
+                var summ = JsonSerializer.Deserialize(text, SdkJsonContext.Default.SessionSummaryEntry);
                 if (summ is not null) results.Add(summ);
             }
             catch
@@ -322,7 +323,7 @@ public sealed class FileSessionStore : ISessionStore
         if (!File.Exists(path)) return null;
         try
         {
-            return JsonSerializer.Deserialize<SessionSummaryEntry>(File.ReadAllText(path, Encoding.UTF8));
+            return JsonSerializer.Deserialize(File.ReadAllText(path, Encoding.UTF8), SdkJsonContext.Default.SessionSummaryEntry);
         }
         catch
         {
@@ -341,7 +342,7 @@ public sealed class FileSessionStore : ISessionStore
         var tmp = Path.Combine(dir, "." + Path.GetFileName(path) + "." + Guid.NewGuid().ToString("N") + ".tmp");
         try
         {
-            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(summary));
+            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(summary, SdkJsonContext.Default.SessionSummaryEntry));
             using (var fs = OpenPrivateFile(tmp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
             {
                 fs.Write(bytes, 0, bytes.Length);

@@ -256,7 +256,7 @@ public class ClaudeSDKClient : IAsyncDisposable
         };
 
         await _transport.WriteAsync(
-            JsonSerializer.Serialize(QueryHandler.StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
+            SdkJson.Serialize(QueryHandler.StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
             cancellationToken);
     }
 
@@ -281,7 +281,7 @@ public class ClaudeSDKClient : IAsyncDisposable
             if (!message.ContainsKey("session_id"))
                 message = new Dictionary<string, object?>(message) { ["session_id"] = sessionId };
             await _transport.WriteAsync(
-                JsonSerializer.Serialize(QueryHandler.StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
+                SdkJson.Serialize(QueryHandler.StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
                 cancellationToken);
         }
     }
@@ -372,7 +372,7 @@ public class ClaudeSDKClient : IAsyncDisposable
     public async Task<McpStatusResponse> ListMcpServersAsync(CancellationToken cancellationToken = default)
     {
         var raw = await GetMcpStatusAsync(cancellationToken);
-        return JsonSerializer.Deserialize<McpStatusResponse>(raw.GetRawText())
+        return raw.Deserialize(SdkJsonContext.Default.McpStatusResponse)
             ?? new McpStatusResponse { McpServers = Array.Empty<McpServerStatus>() };
     }
 
@@ -415,7 +415,7 @@ public class ClaudeSDKClient : IAsyncDisposable
         if (_queryHandler == null)
             throw new CliConnectionException("Not connected. Call ConnectAsync() first.");
         var raw = await _queryHandler.GetContextUsageAsync(cancellationToken);
-        return JsonSerializer.Deserialize<ContextUsageResponse>(raw.GetRawText())
+        return raw.Deserialize(SdkJsonContext.Default.ContextUsageResponse)
             ?? throw new ClaudeSDKException("Empty context usage response");
     }
 
