@@ -3,6 +3,7 @@
 // (Python uses asyncio/trio; .NET uses Task + CancellationToken natively.)
 
 using System.Diagnostics.CodeAnalysis;
+using System.Reflection;
 
 namespace Claude.AgentSdk.Sessions;
 
@@ -63,43 +64,56 @@ internal static class TaskCompat
         => token.IsCancellationRequested && ex.CancellationToken == token;
 
     /// <summary>
-    /// Reflection check: does <paramref name="instance"/>'s runtime type
-    /// override <paramref name="methodName"/> from <paramref name="declaringType"/>?
-    /// Mirrors Python's <c>_store_implements</c> default-interface detection.
+    /// Does <paramref name="instance"/>'s runtime type implement
+    /// <paramref name="methodName"/> of <see cref="ISessionStore"/> itself, rather
+    /// than inheriting the interface's default (which throws
+    /// <see cref="NotImplementedException"/>)? Mirrors Python's
+    /// <c>_store_implements</c> default-interface detection.
     /// </summary>
-    public static bool OverridesMethod(
-        object instance,
-        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.NonPublicMethods)]
-        Type declaringType,
-        string methodName)
+    /// <remarks>
+    /// Looks for an implicit (same name) or explicit
+    /// (<c>Claude.AgentSdk.ISessionStore.Name</c>) implementation with the
+    /// interface method's parameter types on the class hierarchy.
+    /// <see cref="Type.GetInterfaceMap"/> would be exact but is not supported
+    /// under NativeAOT; the <see cref="DynamicallyAccessedMembersAttribute"/>
+    /// on <see cref="ISessionStore"/> keeps every implementation's methods
+    /// visible to this lookup in trimmed and AOT apps.
+    /// </remarks>
+    public static bool OverridesMethod(ISessionStore instance, string methodName)
     {
-        var t = instance.GetType();
-        var iface = declaringType;
-        if (!iface.IsAssignableFrom(t)) return false;
-        try
+        var interfaceMethod = typeof(ISessionStore).GetMethod(methodName);
+        if (interfaceMethod is null)
+            return false;
+        var parameterTypes = interfaceMethod.GetParameters().Select(p => p.ParameterType).ToArray();
+        var explicitName = typeof(ISessionStore).FullName + "." + methodName;
+
+        for (var type = instance.GetType(); type is not null && type != typeof(object); type = BaseTypeOf(type))
         {
-            var map = t.GetInterfaceMap(iface);
-            for (int i = 0; i < map.InterfaceMethods.Length; i++)
+            foreach (var method in DeclaredInstanceMethods(type))
             {
-                if (map.InterfaceMethods[i].Name == methodName)
-                {
-                    // Default interface method: TargetMethods[i] == InterfaceMethods[i]
-                    // and DeclaringType is the interface itself.
-                    var target = map.TargetMethods[i];
-                    return target != null && target.DeclaringType != iface;
-                }
+                if ((method.Name == methodName || method.Name == explicitName) &&
+                    method.ReturnType == interfaceMethod.ReturnType &&
+                    method.GetParameters().Select(p => p.ParameterType).SequenceEqual(parameterTypes))
+                    return true;
             }
-        }
-        catch (ArgumentException)
-        {
-            // Type does not implement the interface explicitly — fall through.
-        }
-        catch (NotSupportedException)
-        {
-            // Interface maps unavailable on this runtime: assume implemented; an
-            // unimplemented optional method still fails later with NotImplementedException.
-            return true;
         }
         return false;
     }
+
+    private static MethodInfo[] DeclaredInstanceMethods(
+        [DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.NonPublicMethods)]
+        Type type) =>
+        type.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+
+    // Justification: every class in an ISessionStore implementation's hierarchy
+    // that declares a method this lookup can match either implements
+    // ISessionStore itself (an explicit implementation requires it) or
+    // contributes public methods to a derived implementer. The type-hierarchy
+    // [DynamicallyAccessedMembers] on ISessionStore preserves both: its
+    // PublicMethods include inherited public methods and every implementing
+    // class keeps its own non-public methods.
+    [UnconditionalSuppressMessage("Trimming", "IL2073:DynamicallyAccessedMembers",
+        Justification = "ISessionStore's type-hierarchy annotation covers the whole implementation hierarchy; see comment.")]
+    [return: DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicMethods | DynamicallyAccessedMemberTypes.NonPublicMethods)]
+    private static Type? BaseTypeOf(Type type) => type.BaseType;
 }

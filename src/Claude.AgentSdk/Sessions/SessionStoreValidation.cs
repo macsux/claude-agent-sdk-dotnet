@@ -17,7 +17,7 @@ public static class SessionStoreValidation
     /// <see cref="NotImplementedException"/>.
     /// </summary>
     public static bool StoreImplements(ISessionStore store, string methodName)
-        => TaskCompat.OverridesMethod(store, typeof(ISessionStore), methodName);
+        => TaskCompat.OverridesMethod(store, methodName);
 
     /// <summary>
     /// Throw <see cref="ArgumentException"/> for invalid

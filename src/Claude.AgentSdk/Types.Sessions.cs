@@ -177,6 +177,12 @@ public record SessionMessage(
 /// The InMemorySessionStore, file-based store, conformance harness, and wiring
 /// into ClaudeAgentOptions/QueryHandler arrive in Phase 3B.</para>
 /// </summary>
+// Type-hierarchy annotation: keeps the methods of every implementation so
+// SessionStoreValidation.StoreImplements can tell an implemented optional method
+// from the interface default in trimmed and NativeAOT apps.
+[System.Diagnostics.CodeAnalysis.DynamicallyAccessedMembers(
+    System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.PublicMethods |
+    System.Diagnostics.CodeAnalysis.DynamicallyAccessedMemberTypes.NonPublicMethods)]
 public interface ISessionStore
 {
     /// <summary>Mirror a batch of transcript entries.</summary>
