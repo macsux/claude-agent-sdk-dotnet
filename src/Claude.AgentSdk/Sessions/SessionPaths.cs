@@ -76,18 +76,90 @@ public static class SessionPaths
     public static string ProjectKeyForDirectory(string? directory = null)
     {
         var cwd = directory ?? Environment.CurrentDirectory;
+        return SanitizePath(CanonicalizePath(cwd));
+    }
+
+    /// <summary>
+    /// Resolve a directory path to its canonical form: realpath (absolute,
+    /// symlinks resolved) + NFC. Mirrors Python <c>_canonicalize_path</c>
+    /// so e.g. macOS <c>/tmp</c> → <c>/private/tmp</c> yields the same
+    /// project key the CLI uses.
+    /// </summary>
+    public static string CanonicalizePath(string path)
+    {
+        string resolved;
         try
         {
-            cwd = Path.GetFullPath(cwd);
+            resolved = RealPath(path);
         }
         catch
         {
-            // fall through with the original value — sanitize handles either.
+            resolved = path;
         }
-        // NFC normalize like Python does (handles HFS+ decomposed forms).
-        cwd = cwd.Normalize(NormalizationForm.FormC);
-        return SanitizePath(cwd);
+        return resolved.Normalize(NormalizationForm.FormC);
     }
+
+    /// <summary>
+    /// .NET equivalent of Python's non-strict <c>os.path.realpath</c>: make
+    /// <paramref name="path"/> absolute and resolve every symlink component
+    /// that exists; non-existent trailing components are appended verbatim.
+    /// </summary>
+    public static string RealPath(string path)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        // Join with cwd without lexical ".." collapsing: ".." must apply to
+        // the *resolved* parent, as in POSIX realpath.
+        var abs = Path.IsPathFullyQualified(path) ? path : Path.Combine(Environment.CurrentDirectory, path);
+        var root = Path.GetPathRoot(abs) ?? string.Empty;
+        var pending = new LinkedList<string>(SplitComponents(abs[root.Length..]));
+        var current = root;
+        var budget = 40; // like the kernel's MAXSYMLINKS; guards cycles
+
+        while (pending.First is { } node)
+        {
+            var part = node.Value;
+            pending.RemoveFirst();
+            if (part == ".") continue;
+            if (part == "..")
+            {
+                current = Path.GetDirectoryName(current) ?? current;
+                continue;
+            }
+
+            var next = Path.Combine(current, part);
+            string? link = null;
+            if (budget > 0)
+            {
+                try
+                {
+                    // FileInfo.LinkTarget uses lstat and works for dir links too.
+                    link = new FileInfo(next).LinkTarget;
+                }
+                catch
+                {
+                    link = null;
+                }
+            }
+
+            if (link is null)
+            {
+                current = next;
+                continue;
+            }
+
+            budget--;
+            // Splice the link target's components in front of the remainder.
+            var linkRoot = Path.IsPathRooted(link) ? Path.GetPathRoot(link) ?? string.Empty : null;
+            var linkParts = SplitComponents(linkRoot is null ? link : link[linkRoot.Length..]);
+            for (int i = linkParts.Length - 1; i >= 0; i--) pending.AddFirst(linkParts[i]);
+            if (linkRoot is not null) current = linkRoot;
+        }
+        return current;
+    }
+
+    private static string[] SplitComponents(string s)
+        => s.Split(new[] { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar },
+            StringSplitOptions.RemoveEmptyEntries);
 
     /// <summary>
     /// Returns the Claude config home directory, respecting

@@ -58,8 +58,20 @@ public static class SessionMutations
             var previous = current;
             current = current.Normalize(NormalizationForm.FormKC);
             var sb = new StringBuilder(current.Length);
+            // Iterate by code point (Python str semantics): surrogate pairs
+            // are classified as one astral char so e.g. tag characters
+            // U+E0000-E007F (Cf) and plane-15/16 private use (Co) are
+            // stripped. Lone surrogates are kept (Python category Cs).
             for (int j = 0; j < current.Length; j++)
             {
+                if (char.IsSurrogatePair(current, j))
+                {
+                    var cp = char.ConvertToUtf32(current[j], current[j + 1]);
+                    if (!FormatCategories.Contains(CharUnicodeInfo.GetUnicodeCategory(cp)))
+                        sb.Append(current, j, 2);
+                    j++;
+                    continue;
+                }
                 var c = current[j];
                 if (!FormatCategories.Contains(CharUnicodeInfo.GetUnicodeCategory(c)))
                     sb.Append(c);
@@ -266,9 +278,13 @@ public static class SessionMutations
         if (writable.Count == 0)
             throw new InvalidOperationException($"Session {sessionId} has no messages to fork");
 
-        var byUuid = transcript
-            .Where(e => StringOf(e, "uuid") is not null)
-            .ToDictionary(e => StringOf(e, "uuid")!, e => e);
+        // Duplicate uuids: last entry wins (Python dict assignment, session_mutations.py _build_fork_lines).
+        var byUuid = new Dictionary<string, JsonObject>();
+        foreach (var e in transcript)
+        {
+            var u = StringOf(e, "uuid");
+            if (u is not null) byUuid[u] = e;
+        }
 
         var forkedSessionId = Guid.NewGuid().ToString();
         var now = IsoNow();
