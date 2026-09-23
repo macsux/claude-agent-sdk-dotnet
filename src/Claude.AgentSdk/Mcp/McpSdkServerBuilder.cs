@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Claude.AgentSdk;
@@ -54,13 +55,19 @@ public sealed class McpSdkServerBuilder
                     .Select(t => t.Definition)
                     .ToList()
             ),
+            // Unknown tools, invalid arguments and handler failures all come back as isError
+            // results the model can read, never as protocol errors (Python create_sdk_mcp_server).
             CallTool = async (toolName, args, ct) =>
             {
                 if (!_tools.TryGetValue(toolName, out var tool))
-                    return McpToolResults.Text($"Unknown tool: '{toolName}'", isError: true);
+                    return McpToolResults.Text($"Tool '{toolName}' not found", isError: true);
 
                 try
                 {
+                    var validationError = McpInputSchemaValidator.Validate(args, tool.Definition.InputSchema!.Value);
+                    if (validationError != null)
+                        return McpToolResults.Text($"Input validation error: {validationError}", isError: true);
+
                     return await tool.InvokeAsync(args, ct).ConfigureAwait(false);
                 }
                 catch (Exception ex)
@@ -98,8 +105,18 @@ public sealed class McpSdkServerBuilder
                 Name = name,
                 Description = description,
                 InputSchema = inputSchema,
-                Annotations = annotations
+                Annotations = annotations,
+                Meta = BuildMeta(annotations)
             };
+        }
+
+        // Client-specific hints travel in _meta under namespaced keys because MCP clients drop
+        // annotation fields they do not know (Python _build_meta).
+        private static IReadOnlyDictionary<string, object?>? BuildMeta(McpToolAnnotations? annotations)
+        {
+            if (annotations?.MaxResultSizeChars is not { } maxSize)
+                return null;
+            return new Dictionary<string, object?> { ["anthropic/maxResultSizeChars"] = maxSize };
         }
 
         public static ToolRegistration Create(string name, string? description, Delegate handler, McpToolAnnotations? annotations = null)
@@ -112,7 +129,17 @@ public sealed class McpSdkServerBuilder
         public async Task<McpToolResult> InvokeAsync(JsonElement args, CancellationToken ct)
         {
             var invokeArgs = _bindingPlan.BindArguments(args, ct);
-            var result = _handler.DynamicInvoke(invokeArgs);
+            object? result;
+            try
+            {
+                result = _handler.DynamicInvoke(invokeArgs);
+            }
+            catch (TargetInvocationException tie) when (tie.InnerException != null)
+            {
+                // Surface the handler's own exception (and message), not the reflection wrapper.
+                ExceptionDispatchInfo.Capture(tie.InnerException).Throw();
+                throw;
+            }
             var value = await AwaitIfNeededAsync(result).ConfigureAwait(false);
             return ConvertToToolResult(value);
         }

@@ -351,12 +351,13 @@ public class McpBridgeTests
 
         var response = await bridge.SendMessageAsync(request);
 
+        // Python (mcp Server): unknown methods are JSON-RPC "Method not found".
         Assert.True(response.TryGetProperty("error", out var error));
-        Assert.Equal(-32603, error.GetProperty("code").GetInt32());
+        Assert.Equal(-32601, error.GetProperty("code").GetInt32());
     }
 
     [Fact]
-    public async Task SdkMcpBridge_ReturnsEmptyToolsWhenNoHandler()
+    public async Task SdkMcpBridge_ToolsListWithoutHandler_IsMethodNotFound()
     {
         var handlers = new McpServerHandlers(); // No ListTools handler
 
@@ -371,9 +372,10 @@ public class McpBridgeTests
         });
 
         var response = await bridge.SendMessageAsync(request);
-        var tools = response.GetProperty("result").GetProperty("tools");
 
-        Assert.Equal(0, tools.GetArrayLength());
+        // Python (mcp Server): a method with no registered handler is "Method not found".
+        Assert.False(response.TryGetProperty("result", out _));
+        Assert.Equal(-32601, response.GetProperty("error").GetProperty("code").GetInt32());
     }
 
     [Fact]
