@@ -23,8 +23,8 @@ public sealed class ClaudeAgentOptionsBuilder
     private IReadOnlyList<string>? _tools;
     private readonly List<string> _allowedTools = [];
     private readonly List<string> _disallowedTools = [];
-    private object? _systemPrompt;
-    private object? _mcpServers;
+    private SystemPromptConfig? _systemPrompt;
+    private McpServersConfig? _mcpServers;
     private PermissionMode? _permissionMode;
     private bool _continueConversation;
     private string? _resume;
@@ -58,12 +58,17 @@ public sealed class ClaudeAgentOptionsBuilder
     private bool _enableFileCheckpointing;
     private string? _sessionId;
     private TaskBudget? _taskBudget;
-    private object? _skills;
+    private SkillsConfig? _skills;
     private bool _strictMcpConfig;
     private bool _includeHookEvents;
     private ISessionStore? _sessionStore;
     private SessionStoreFlushMode _sessionStoreFlush = SessionStoreFlushMode.Batched;
-    private object? _toolsConfig;
+    private ToolsPreset? _toolsConfig;
+    private string? _resumeSessionAt;
+    private string? _resumeDropsTurn;
+    private bool _forwardSubagentText;
+    private bool _verbatimPrompts;
+    private int _loadTimeoutMs = 60_000;
 
     /// <summary>Set the system prompt.</summary>
     public ClaudeAgentOptionsBuilder SystemPrompt(string prompt)
@@ -83,6 +88,33 @@ public sealed class ClaudeAgentOptionsBuilder
     public ClaudeAgentOptionsBuilder SystemPrompt(SystemPromptFile file)
     {
         _systemPrompt = file;
+        return this;
+    }
+
+    /// <summary>
+    /// Set a custom system prompt in the form that can also set
+    /// <see cref="SystemPromptCustom.Snapshot"/> (Python <c>SystemPromptCustom</c>).
+    /// </summary>
+    public ClaudeAgentOptionsBuilder SystemPrompt(SystemPromptCustom custom)
+    {
+        _systemPrompt = custom;
+        return this;
+    }
+
+    /// <summary>Set any system prompt configuration.</summary>
+    public ClaudeAgentOptionsBuilder SystemPrompt(SystemPromptConfig config)
+    {
+        _systemPrompt = config;
+        return this;
+    }
+
+    /// <summary>
+    /// Set a custom system prompt together with its <c>snapshot</c> behavior
+    /// (see <see cref="SystemPromptPreset.Snapshot"/>).
+    /// </summary>
+    public ClaudeAgentOptionsBuilder SystemPrompt(string prompt, bool snapshot)
+    {
+        _systemPrompt = new SystemPromptCustom { Prompt = prompt, Snapshot = snapshot };
         return this;
     }
 
@@ -235,6 +267,58 @@ public sealed class ClaudeAgentOptionsBuilder
     public ClaudeAgentOptionsBuilder Resume(string sessionId)
     {
         _resume = sessionId;
+        return this;
+    }
+
+    /// <summary>
+    /// When resuming, only load the conversation up to and including the
+    /// message with this UUID (<c>--resume-session-at</c>). Optionally declare
+    /// the user prompt whose turn the truncation discards
+    /// (<c>--resume-drops-turn</c>), so the CLI refuses the resume if anything
+    /// else would be dropped. Python: <c>resume_session_at</c> /
+    /// <c>resume_drops_turn</c>.
+    /// </summary>
+    public ClaudeAgentOptionsBuilder ResumeSessionAt(string messageUuid, string? dropsTurn = null)
+    {
+        _resumeSessionAt = messageUuid;
+        _resumeDropsTurn = dropsTurn;
+        return this;
+    }
+
+    /// <summary>Set <see cref="ClaudeAgentOptions.ResumeDropsTurn"/> (<c>--resume-drops-turn</c>).</summary>
+    public ClaudeAgentOptionsBuilder ResumeDropsTurn(string promptUuid)
+    {
+        _resumeDropsTurn = promptUuid;
+        return this;
+    }
+
+    /// <summary>
+    /// Forward subagent text and thinking blocks as messages in the stream.
+    /// Python: <c>forward_subagent_text</c>.
+    /// </summary>
+    public ClaudeAgentOptionsBuilder ForwardSubagentText(bool value = true)
+    {
+        _forwardSubagentText = value;
+        return this;
+    }
+
+    /// <summary>
+    /// Deliver every prompt as written (no <c>@path</c> expansion, no
+    /// slash-command dispatch). Python: <c>verbatim_prompts</c>.
+    /// </summary>
+    public ClaudeAgentOptionsBuilder VerbatimPrompts(bool value = true)
+    {
+        _verbatimPrompts = value;
+        return this;
+    }
+
+    /// <summary>
+    /// Timeout in milliseconds for each SessionStore call during resume
+    /// materialization. Python: <c>load_timeout_ms</c>.
+    /// </summary>
+    public ClaudeAgentOptionsBuilder LoadTimeoutMs(int milliseconds)
+    {
+        _loadTimeoutMs = milliseconds;
         return this;
     }
 
@@ -496,8 +580,12 @@ public sealed class ClaudeAgentOptionsBuilder
         return this;
     }
 
-    /// <summary>Set MCP servers directly.</summary>
-    public ClaudeAgentOptionsBuilder McpServers(object servers)
+    /// <summary>
+    /// Set MCP servers directly: a <c>Dictionary&lt;string, object&gt;</c> of
+    /// name → config, or a path to an MCP config file / JSON string (both
+    /// convert implicitly to <see cref="McpServersConfig"/>).
+    /// </summary>
+    public ClaudeAgentOptionsBuilder McpServers(McpServersConfig servers)
     {
         _mcpServers = servers;
         return this;
@@ -561,7 +649,12 @@ public sealed class ClaudeAgentOptionsBuilder
             IncludeHookEvents = _includeHookEvents,
             SessionStore = _sessionStore,
             SessionStoreFlush = _sessionStoreFlush,
-            ToolsPreset = _toolsConfig as ToolsPreset
+            ToolsPreset = _toolsConfig,
+            ResumeSessionAt = _resumeSessionAt,
+            ResumeDropsTurn = _resumeDropsTurn,
+            ForwardSubagentText = _forwardSubagentText,
+            VerbatimPrompts = _verbatimPrompts,
+            LoadTimeoutMs = _loadTimeoutMs
         };
     }
 #pragma warning restore CS0618

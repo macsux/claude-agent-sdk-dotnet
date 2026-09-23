@@ -31,35 +31,27 @@ internal static class MessageParser
 
         // Hook events arrive as system messages with subtype hook_started/hook_response.
         // Python commit c1182a4.
-        if (data.TryGetProperty("type", out var topType) &&
-            topType.ValueKind == JsonValueKind.String &&
-            topType.GetString() == "system" &&
-            data.TryGetProperty("subtype", out var hookSubtype) &&
-            hookSubtype.ValueKind == JsonValueKind.String &&
-            (hookSubtype.GetString() == "hook_started" || hookSubtype.GetString() == "hook_response"))
+        if (Str(data, "type") == "system" &&
+            Str(data, "subtype") is "hook_started" or "hook_response")
         {
             var hookEventName =
-                (data.TryGetProperty("hook_event", out var he) && he.ValueKind == JsonValueKind.String ? he.GetString() : null)
-                ?? (data.TryGetProperty("hook_name", out var hn) && hn.ValueKind == JsonValueKind.String ? hn.GetString() : null)
-                ?? (data.TryGetProperty("hook_event_name", out var hen) && hen.ValueKind == JsonValueKind.String ? hen.GetString() : null)
+                NonEmpty(Str(data, "hook_event"))
+                ?? NonEmpty(Str(data, "hook_name"))
+                ?? NonEmpty(Str(data, "hook_event_name"))
                 ?? string.Empty;
             return new HookEventMessage
             {
-                Subtype = hookSubtype.GetString()!,
+                Subtype = Str(data, "subtype")!,
                 Data = data.Clone(),
                 HookEventName = hookEventName,
-                SessionId = data.TryGetProperty("session_id", out var sid) ? sid.GetString() : null,
-                Uuid = data.TryGetProperty("uuid", out var hu) ? hu.GetString() : null
+                SessionId = Str(data, "session_id"),
+                Uuid = Str(data, "uuid")
             };
         }
 
-        if (!data.TryGetProperty("type", out var typeElement) ||
-            typeElement.ValueKind != JsonValueKind.String)
-        {
+        var messageType = Str(data, "type");
+        if (string.IsNullOrEmpty(messageType))
             throw new MessageParseException("Message missing 'type' field", data);
-        }
-
-        var messageType = typeElement.GetString();
 
         return messageType switch
         {
@@ -69,6 +61,7 @@ internal static class MessageParser
             "result" => ParseResultMessage(data),
             "stream_event" => ParseStreamEvent(data),
             "rate_limit_event" => ParseRateLimitEvent(data),
+            "conversation_reset" => ParseConversationReset(data),
             _ => LogAndSkipUnknown(messageType)
         };
     }
@@ -95,6 +88,99 @@ internal static class MessageParser
         return msg;
     }
 
+    private static string? Str(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+    private static string? NonEmpty(string? s) => string.IsNullOrEmpty(s) ? null : s;
+
+    private static JsonElement? Raw(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind != JsonValueKind.Null ? v.Clone() : null;
+
+    private static int? Int(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i) ? i : null;
+
+    private static bool? Bool(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v) && v.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? v.GetBoolean()
+            : null;
+
+    /// <summary>Required string field; a missing key is a parse error (Python <c>KeyError</c>).</summary>
+    private static string Req(JsonElement e, string name) =>
+        e.TryGetProperty(name, out var v)
+            ? v.GetString() ?? throw new KeyNotFoundException($"'{name}'")
+            : throw new KeyNotFoundException($"'{name}'");
+
+    /// <summary>
+    /// Return <c>data.origin</c> if it is a well-formed origin object (an
+    /// object with a string <c>kind</c>). Unmodelled keys are preserved in
+    /// <see cref="MessageOrigin.AdditionalProperties"/>. Python: <c>_parse_origin</c>.
+    /// </summary>
+    internal static MessageOrigin? ParseOrigin(JsonElement data)
+    {
+        if (!data.TryGetProperty("origin", out var o) || o.ValueKind != JsonValueKind.Object)
+            return null;
+        var kind = Str(o, "kind");
+        if (kind == null)
+            return null;
+
+        Dictionary<string, JsonElement>? extras = null;
+        foreach (var prop in o.EnumerateObject())
+        {
+            switch (prop.Name)
+            {
+                case "kind" or "server" or "from" or "name" or "fromSession" or "senderTaskId" or "body" or "subkind":
+                    break;
+                case "verifiedPeerPid" when prop.Value.ValueKind == JsonValueKind.Number:
+                    break;
+                default:
+                    (extras ??= new())[prop.Name] = prop.Value.Clone();
+                    break;
+            }
+        }
+
+        return new MessageOrigin
+        {
+            Kind = kind,
+            Server = Str(o, "server"),
+            From = Str(o, "from"),
+            Name = Str(o, "name"),
+            FromSession = Str(o, "fromSession"),
+            SenderTaskId = Str(o, "senderTaskId"),
+            Body = Str(o, "body"),
+            VerifiedPeerPid = o.TryGetProperty("verifiedPeerPid", out var pid) &&
+                              pid.ValueKind == JsonValueKind.Number && pid.TryGetInt64(out var p)
+                ? p
+                : null,
+            Subkind = Str(o, "subkind"),
+            AdditionalProperties = extras
+        };
+    }
+
+    /// <summary>
+    /// Parse the blocks of a user message's content array. Python's user
+    /// branch materializes only text / tool_use / tool_result blocks and skips
+    /// anything else (images, documents, ...).
+    /// </summary>
+    internal static IReadOnlyList<ContentBlock> ParseUserContentBlocks(JsonElement content)
+    {
+        var blocks = new List<ContentBlock>();
+        foreach (var block in content.EnumerateArray())
+        {
+            if (block.ValueKind != JsonValueKind.Object)
+                throw new MessageParseException($"Invalid content block (expected object, got {block.ValueKind})", content);
+            ContentBlock? parsed = Req(block, "type") switch
+            {
+                "text" => new TextBlock(Req(block, "text")),
+                "tool_use" => new ToolUseBlock(Req(block, "id"), Req(block, "name"), block.GetProperty("input").Clone()),
+                "tool_result" => new ToolResultBlock(Req(block, "tool_use_id"), Raw(block, "content"), Bool(block, "is_error")),
+                _ => null
+            };
+            if (parsed != null)
+                blocks.Add(parsed);
+        }
+        return blocks;
+    }
+
     private static UserMessage ParseUserMessage(JsonElement data)
     {
         try
@@ -102,13 +188,18 @@ internal static class MessageParser
             var message = data.GetProperty("message");
             var content = message.GetProperty("content");
 
+            // Validate block shapes like Python does (a malformed block is a parse
+            // error), while keeping the raw content on UserMessage.Content.
+            if (content.ValueKind == JsonValueKind.Array)
+                ParseUserContentBlocks(content);
+
             return new UserMessage
             {
                 Content = content.Clone(),
-                Uuid = data.TryGetProperty("uuid", out var uuid) ? uuid.GetString() : null,
-                ParentToolUseId = data.TryGetProperty("parent_tool_use_id", out var pid)
-                    ? pid.GetString()
-                    : null
+                Uuid = Str(data, "uuid"),
+                ParentToolUseId = Str(data, "parent_tool_use_id"),
+                ToolUseResult = Raw(data, "tool_use_result"),
+                Origin = ParseOrigin(data)
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -123,41 +214,26 @@ internal static class MessageParser
         {
             var message = data.GetProperty("message");
             var contentArray = message.GetProperty("content");
-            var model = message.GetProperty("model").GetString()
-                ?? throw new MessageParseException("Missing model in assistant message", data);
+            if (contentArray.ValueKind != JsonValueKind.Array)
+                throw new MessageParseException(
+                    $"Invalid assistant content (expected list, got {contentArray.ValueKind})", data);
+            var model = Req(message, "model");
 
             var contentBlocks = new List<ContentBlock>();
 
             foreach (var block in contentArray.EnumerateArray())
             {
-                var blockType = block.GetProperty("type").GetString();
-                ContentBlock? contentBlock = blockType switch
+                if (block.ValueKind != JsonValueKind.Object)
+                    throw new MessageParseException($"Invalid content block (expected object, got {block.ValueKind})", data);
+                ContentBlock? contentBlock = Req(block, "type") switch
                 {
-                    "text" => new TextBlock(block.GetProperty("text").GetString()!),
-                    "thinking" => new ThinkingBlock(
-                        block.GetProperty("thinking").GetString()!,
-                        block.GetProperty("signature").GetString()!
-                    ),
-                    "tool_use" => new ToolUseBlock(
-                        block.GetProperty("id").GetString()!,
-                        block.GetProperty("name").GetString()!,
-                        block.GetProperty("input").Clone()
-                    ),
-                    "tool_result" => new ToolResultBlock(
-                        block.GetProperty("tool_use_id").GetString()!,
-                        block.TryGetProperty("content", out var c) ? c.Clone() : null,
-                        block.TryGetProperty("is_error", out var e) ? e.GetBoolean() : null
-                    ),
+                    "text" => new TextBlock(Req(block, "text")),
+                    "thinking" => new ThinkingBlock(Req(block, "thinking"), Req(block, "signature")),
+                    "tool_use" => new ToolUseBlock(Req(block, "id"), Req(block, "name"), block.GetProperty("input").Clone()),
+                    "tool_result" => new ToolResultBlock(Req(block, "tool_use_id"), Raw(block, "content"), Bool(block, "is_error")),
                     // Python commit 6ab97b4: server_tool_use / advisor_tool_result.
-                    "server_tool_use" => new ServerToolUseBlock(
-                        block.GetProperty("id").GetString()!,
-                        block.GetProperty("name").GetString()!,
-                        block.GetProperty("input").Clone()
-                    ),
-                    "advisor_tool_result" => new ServerToolResultBlock(
-                        block.GetProperty("tool_use_id").GetString()!,
-                        block.GetProperty("content").Clone()
-                    ),
+                    "server_tool_use" => new ServerToolUseBlock(Req(block, "id"), Req(block, "name"), block.GetProperty("input").Clone()),
+                    "advisor_tool_result" => new ServerToolResultBlock(Req(block, "tool_use_id"), block.GetProperty("content").Clone()),
                     // Python skips block types it doesn't know (forward compatibility
                     // with newer CLIs) instead of failing the whole message.
                     _ => null
@@ -166,36 +242,33 @@ internal static class MessageParser
                     contentBlocks.Add(contentBlock);
             }
 
-            AssistantMessageError? error = null;
-            if (message.TryGetProperty("error", out var errorElement) &&
-                errorElement.ValueKind == JsonValueKind.String)
+            // Python reads `error` from the top-level frame (data.get("error")),
+            // not from the inner API message. The inner location is kept as a
+            // fallback for frames produced by older SDK builds.
+            var errorStr = Str(data, "error") ?? Str(message, "error");
+            AssistantMessageError? error = errorStr switch
             {
-                var errorStr = errorElement.GetString();
-                error = errorStr switch
-                {
-                    "authentication_failed" => AssistantMessageError.AuthenticationFailed,
-                    "billing_error" => AssistantMessageError.BillingError,
-                    "rate_limit" => AssistantMessageError.RateLimit,
-                    "invalid_request" => AssistantMessageError.InvalidRequest,
-                    "server_error" => AssistantMessageError.ServerError,
-                    _ => AssistantMessageError.Unknown
-                };
-            }
+                null => null,
+                "authentication_failed" => AssistantMessageError.AuthenticationFailed,
+                "billing_error" => AssistantMessageError.BillingError,
+                "rate_limit" => AssistantMessageError.RateLimit,
+                "invalid_request" => AssistantMessageError.InvalidRequest,
+                "server_error" => AssistantMessageError.ServerError,
+                _ => AssistantMessageError.Unknown
+            };
 
             return new AssistantMessage
             {
                 Content = contentBlocks,
                 Model = model,
-                ParentToolUseId = data.TryGetProperty("parent_tool_use_id", out var pid)
-                    ? pid.GetString()
-                    : null,
+                ParentToolUseId = Str(data, "parent_tool_use_id"),
                 Error = error,
                 // Python commit fc82420: preserve per-turn usage.
-                Usage = message.TryGetProperty("usage", out var usage) ? usage.Clone() : null,
-                MessageId = message.TryGetProperty("id", out var mid) ? mid.GetString() : null,
-                StopReason = message.TryGetProperty("stop_reason", out var sr) ? sr.GetString() : null,
-                SessionId = data.TryGetProperty("session_id", out var sid) ? sid.GetString() : null,
-                Uuid = data.TryGetProperty("uuid", out var u) ? u.GetString() : null
+                Usage = Raw(message, "usage"),
+                MessageId = Str(message, "id"),
+                StopReason = Str(message, "stop_reason"),
+                SessionId = Str(data, "session_id"),
+                Uuid = Str(data, "uuid")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -204,11 +277,16 @@ internal static class MessageParser
         }
     }
 
+    private static TaskUsage ParseTaskUsage(JsonElement u) => new(
+        u.GetProperty("total_tokens").GetInt32(),
+        u.GetProperty("tool_uses").GetInt32(),
+        u.GetProperty("duration_ms").GetInt32());
+
     private static SystemMessage ParseSystemMessage(JsonElement data)
     {
         try
         {
-            var subtype = data.GetProperty("subtype").GetString()!;
+            var subtype = Req(data, "subtype");
             var clone = data.Clone();
 
             // Python commit 9af27d7: task_started / task_progress / task_notification.
@@ -219,29 +297,28 @@ internal static class MessageParser
                     {
                         Subtype = subtype,
                         Data = clone,
-                        TaskId = data.GetProperty("task_id").GetString()!,
-                        Description = data.GetProperty("description").GetString()!,
-                        Uuid = data.GetProperty("uuid").GetString()!,
-                        SessionId = data.GetProperty("session_id").GetString()!,
-                        ToolUseId = data.TryGetProperty("tool_use_id", out var tu) ? tu.GetString() : null,
-                        TaskType = data.TryGetProperty("task_type", out var tt) ? tt.GetString() : null
+                        TaskId = Req(data, "task_id"),
+                        Description = Req(data, "description"),
+                        Uuid = Req(data, "uuid"),
+                        SessionId = Req(data, "session_id"),
+                        ToolUseId = Str(data, "tool_use_id"),
+                        TaskType = Str(data, "task_type")
                     };
                 case "task_progress":
                     return new TaskProgressMessage
                     {
                         Subtype = subtype,
                         Data = clone,
-                        TaskId = data.GetProperty("task_id").GetString()!,
-                        Description = data.GetProperty("description").GetString()!,
-                        Usage = JsonSerializer.Deserialize<TaskUsage>(data.GetProperty("usage").GetRawText())!,
-                        Uuid = data.GetProperty("uuid").GetString()!,
-                        SessionId = data.GetProperty("session_id").GetString()!,
-                        ToolUseId = data.TryGetProperty("tool_use_id", out var tu2) ? tu2.GetString() : null,
-                        LastToolName = data.TryGetProperty("last_tool_name", out var ltn) ? ltn.GetString() : null
+                        TaskId = Req(data, "task_id"),
+                        Description = Req(data, "description"),
+                        Usage = ParseTaskUsage(data.GetProperty("usage")),
+                        Uuid = Req(data, "uuid"),
+                        SessionId = Req(data, "session_id"),
+                        ToolUseId = Str(data, "tool_use_id"),
+                        LastToolName = Str(data, "last_tool_name")
                     };
                 case "task_notification":
-                    var statusStr = data.GetProperty("status").GetString();
-                    var status = statusStr switch
+                    var status = Req(data, "status") switch
                     {
                         "completed" => TaskNotificationStatus.Completed,
                         "failed" => TaskNotificationStatus.Failed,
@@ -254,30 +331,54 @@ internal static class MessageParser
                     {
                         Subtype = subtype,
                         Data = clone,
-                        TaskId = data.GetProperty("task_id").GetString()!,
+                        TaskId = Req(data, "task_id"),
                         Status = status,
-                        OutputFile = data.GetProperty("output_file").GetString()!,
-                        Summary = data.GetProperty("summary").GetString()!,
-                        Uuid = data.GetProperty("uuid").GetString()!,
-                        SessionId = data.GetProperty("session_id").GetString()!,
-                        ToolUseId = data.TryGetProperty("tool_use_id", out var tu3) ? tu3.GetString() : null,
-                        Usage = data.TryGetProperty("usage", out var u) && u.ValueKind != JsonValueKind.Null
-                            ? JsonSerializer.Deserialize<TaskUsage>(u.GetRawText())
+                        OutputFile = Req(data, "output_file"),
+                        Summary = Req(data, "summary"),
+                        Uuid = Req(data, "uuid"),
+                        SessionId = Req(data, "session_id"),
+                        ToolUseId = Str(data, "tool_use_id"),
+                        Usage = data.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object
+                            ? ParseTaskUsage(u)
                             : null
+                    };
+                case "task_updated":
+                    // Terminal task completion sometimes arrives only as a
+                    // task_updated patch (no task_notification), so expose it as
+                    // a typed lifecycle message. Parsed defensively: the patch may
+                    // omit uuid/session_id and parsing must never raise on a
+                    // lifecycle event. Python: TaskUpdatedMessage branch.
+                    var patch = data.TryGetProperty("patch", out var p) && p.ValueKind == JsonValueKind.Object
+                        ? p.Clone()
+                        : JsonDocument.Parse("{}").RootElement.Clone();
+                    return new TaskUpdatedMessage
+                    {
+                        Subtype = subtype,
+                        Data = clone,
+                        TaskId = Str(data, "task_id") ?? string.Empty,
+                        Patch = patch,
+                        Status = Str(patch, "status"),
+                        SessionId = Str(data, "session_id"),
+                        Uuid = Str(data, "uuid")
                     };
                 case "mirror_error":
                     // Python commit 6e3d54f: SDK-synthesized; never emitted by the CLI directly.
                     SessionKey? key = null;
                     if (data.TryGetProperty("key", out var k) && k.ValueKind == JsonValueKind.Object)
                     {
-                        key = JsonSerializer.Deserialize<SessionKey>(k.GetRawText());
+                        key = new SessionKey
+                        {
+                            ProjectKey = Str(k, "project_key") ?? string.Empty,
+                            SessionId = Str(k, "session_id") ?? string.Empty,
+                            Subpath = Str(k, "subpath")
+                        };
                     }
                     return new MirrorErrorMessage
                     {
                         Subtype = subtype,
                         Data = clone,
                         Key = key,
-                        Error = data.TryGetProperty("error", out var er) ? er.GetString() ?? string.Empty : string.Empty
+                        Error = Str(data, "error") ?? string.Empty
                     };
                 default:
                     return new SystemMessage
@@ -287,10 +388,28 @@ internal static class MessageParser
                     };
             }
         }
-        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
+        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException)
         {
             throw new MessageParseException($"Missing required field in system message: {ex.Message}", data);
         }
+    }
+
+    private static ModelUsage ParseModelUsage(JsonElement e)
+    {
+        int I(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i) ? i : 0;
+        return new ModelUsage
+        {
+            InputTokens = I("inputTokens"),
+            OutputTokens = I("outputTokens"),
+            CacheReadInputTokens = I("cacheReadInputTokens"),
+            CacheCreationInputTokens = I("cacheCreationInputTokens"),
+            WebSearchRequests = I("webSearchRequests"),
+            CostUSD = e.TryGetProperty("costUSD", out var c) && c.ValueKind == JsonValueKind.Number ? c.GetDouble() : 0,
+            ContextWindow = I("contextWindow"),
+            MaxOutputTokens = I("maxOutputTokens"),
+            CanonicalModel = Str(e, "canonicalModel"),
+            Provider = Str(e, "provider")
+        };
     }
 
     private static ResultMessage ParseResultMessage(JsonElement data)
@@ -300,11 +419,7 @@ internal static class MessageParser
             DeferredToolUse? deferred = null;
             if (data.TryGetProperty("deferred_tool_use", out var dtu) && dtu.ValueKind == JsonValueKind.Object)
             {
-                deferred = new DeferredToolUse(
-                    dtu.GetProperty("id").GetString()!,
-                    dtu.GetProperty("name").GetString()!,
-                    dtu.GetProperty("input").Clone()
-                );
+                deferred = new DeferredToolUse(Req(dtu, "id"), Req(dtu, "name"), dtu.GetProperty("input").Clone());
             }
 
             IReadOnlyList<string>? errors = null;
@@ -319,30 +434,43 @@ internal static class MessageParser
                 errors = list;
             }
 
+            Dictionary<string, ModelUsage>? modelUsage = null;
+            if (data.TryGetProperty("modelUsage", out var mu) && mu.ValueKind == JsonValueKind.Object)
+            {
+                modelUsage = new Dictionary<string, ModelUsage>();
+                foreach (var entry in mu.EnumerateObject())
+                {
+                    if (entry.Value.ValueKind == JsonValueKind.Object)
+                        modelUsage[entry.Name] = ParseModelUsage(entry.Value);
+                }
+            }
+
             return new ResultMessage
             {
-                Subtype = data.GetProperty("subtype").GetString()!,
+                Subtype = Req(data, "subtype"),
                 DurationMs = data.GetProperty("duration_ms").GetInt32(),
                 DurationApiMs = data.GetProperty("duration_api_ms").GetInt32(),
                 IsError = data.GetProperty("is_error").GetBoolean(),
                 NumTurns = data.GetProperty("num_turns").GetInt32(),
-                SessionId = data.GetProperty("session_id").GetString()!,
+                SessionId = Req(data, "session_id"),
                 TotalCostUsd = data.TryGetProperty("total_cost_usd", out var cost) && cost.ValueKind == JsonValueKind.Number
                     ? cost.GetDecimal()
                     : null,
-                Usage = data.TryGetProperty("usage", out var usage) ? usage.Clone() : null,
-                Result = data.TryGetProperty("result", out var result) ? result.GetString() : null,
-                StructuredOutput = data.TryGetProperty("structured_output", out var so) ? so.Clone() : null,
-                StopReason = data.TryGetProperty("stop_reason", out var sr) ? sr.GetString() : null,
+                Usage = Raw(data, "usage"),
+                Result = Str(data, "result"),
+                StructuredOutput = Raw(data, "structured_output"),
+                StopReason = Str(data, "stop_reason"),
+                ModelUsage = modelUsage,
+                PermissionDenials = Raw(data, "permission_denials"),
                 DeferredToolUse = deferred,
                 Errors = errors,
-                ApiErrorStatus = data.TryGetProperty("api_error_status", out var aes) && aes.ValueKind == JsonValueKind.Number
-                    ? aes.GetInt32()
-                    : null,
-                Uuid = data.TryGetProperty("uuid", out var uu) ? uu.GetString() : null
+                ApiErrorStatus = Int(data, "api_error_status"),
+                Uuid = Str(data, "uuid"),
+                TerminalReason = Str(data, "terminal_reason"),
+                Origin = ParseOrigin(data)
             };
         }
-        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
+        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException)
         {
             throw new MessageParseException($"Missing required field in result message: {ex.Message}", data);
         }
@@ -354,12 +482,10 @@ internal static class MessageParser
         {
             return new StreamEvent
             {
-                Uuid = data.GetProperty("uuid").GetString()!,
-                SessionId = data.GetProperty("session_id").GetString()!,
+                Uuid = Req(data, "uuid"),
+                SessionId = Req(data, "session_id"),
                 Event = data.GetProperty("event").Clone(),
-                ParentToolUseId = data.TryGetProperty("parent_tool_use_id", out var pid)
-                    ? pid.GetString()
-                    : null
+                ParentToolUseId = Str(data, "parent_tool_use_id")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -373,27 +499,25 @@ internal static class MessageParser
         try
         {
             var info = data.GetProperty("rate_limit_info");
-            var statusStr = info.GetProperty("status").GetString();
-            var status = RateLimitEnumHelpers.ParseRateLimitStatus(statusStr)
-                ?? throw new MessageParseException($"Unknown rate_limit status: {statusStr}", data);
+            // Python passes the raw status through; an unrecognized value must not
+            // fail the stream (the raw payload stays on RateLimitInfo.Raw).
+            var statusStr = Req(info, "status");
+            var status = RateLimitEnumHelpers.ParseRateLimitStatus(statusStr) ?? RateLimitStatus.Unknown;
 
-            RateLimitType? rlType = null;
-            if (info.TryGetProperty("rateLimitType", out var rlt) && rlt.ValueKind == JsonValueKind.String)
+            RateLimitType? rlType = Str(info, "rateLimitType") switch
             {
-                rlType = rlt.GetString() switch
-                {
-                    "five_hour" => RateLimitType.FiveHour,
-                    "seven_day" => RateLimitType.SevenDay,
-                    "seven_day_opus" => RateLimitType.SevenDayOpus,
-                    "seven_day_sonnet" => RateLimitType.SevenDaySonnet,
-                    "overage" => RateLimitType.Overage,
-                    _ => null
-                };
-            }
+                "five_hour" => RateLimitType.FiveHour,
+                "seven_day" => RateLimitType.SevenDay,
+                "seven_day_opus" => RateLimitType.SevenDayOpus,
+                "seven_day_sonnet" => RateLimitType.SevenDaySonnet,
+                "overage" => RateLimitType.Overage,
+                _ => null
+            };
 
-            RateLimitStatus? overageStatus = null;
-            if (info.TryGetProperty("overageStatus", out var os) && os.ValueKind == JsonValueKind.String)
-                overageStatus = RateLimitEnumHelpers.ParseRateLimitStatus(os.GetString());
+            var overageStr = Str(info, "overageStatus");
+            RateLimitStatus? overageStatus = overageStr == null
+                ? null
+                : RateLimitEnumHelpers.ParseRateLimitStatus(overageStr) ?? RateLimitStatus.Unknown;
 
             var rli = new RateLimitInfo
             {
@@ -406,21 +530,37 @@ internal static class MessageParser
                 OverageStatus = overageStatus,
                 OverageResetsAt = info.TryGetProperty("overageResetsAt", out var ora) && ora.ValueKind == JsonValueKind.Number
                     ? ora.GetInt64() : null,
-                OverageDisabledReason = info.TryGetProperty("overageDisabledReason", out var odr) && odr.ValueKind == JsonValueKind.String
-                    ? odr.GetString() : null,
+                OverageDisabledReason = Str(info, "overageDisabledReason"),
                 Raw = info.Clone()
             };
 
             return new RateLimitEvent
             {
                 RateLimitInfo = rli,
-                Uuid = data.GetProperty("uuid").GetString()!,
-                SessionId = data.GetProperty("session_id").GetString()!
+                Uuid = Req(data, "uuid"),
+                SessionId = Req(data, "session_id")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
         {
             throw new MessageParseException($"Missing required field in rate_limit_event message: {ex.Message}", data);
+        }
+    }
+
+    private static ConversationResetMessage ParseConversationReset(JsonElement data)
+    {
+        try
+        {
+            return new ConversationResetMessage
+            {
+                NewConversationId = Req(data, "new_conversation_id"),
+                Uuid = Req(data, "uuid"),
+                SessionId = Req(data, "session_id")
+            };
+        }
+        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
+        {
+            throw new MessageParseException($"Missing required field in conversation_reset message: {ex.Message}", data);
         }
     }
 }

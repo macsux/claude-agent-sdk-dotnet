@@ -304,6 +304,20 @@ public record UserMessage : Message
     public string? ParentToolUseId { get; init; }
 
     /// <summary>
+    /// Structured tool result the CLI attaches to tool-result user messages.
+    /// Python: <c>UserMessage.tool_use_result</c>.
+    /// </summary>
+    [JsonPropertyName("tool_use_result")]
+    public JsonElement? ToolUseResult { get; init; }
+
+    /// <summary>
+    /// Provenance of this message — see <see cref="MessageOrigin"/>. <c>null</c>
+    /// when the CLI did not attribute it. Python: <c>UserMessage.origin</c>.
+    /// </summary>
+    [JsonPropertyName("origin")]
+    public MessageOrigin? Origin { get; init; }
+
+    /// <summary>
     /// Gets the content as a string if it's a simple text message.
     /// </summary>
     public string? GetTextContent()
@@ -314,22 +328,15 @@ public record UserMessage : Message
     }
 
     /// <summary>
-    /// Gets the content blocks if the content is an array.
+    /// Gets the content blocks if the content is an array. Like Python's
+    /// parser, only <c>text</c>, <c>tool_use</c> and <c>tool_result</c> blocks
+    /// are materialized; other block types (images, documents, ...) are skipped.
     /// </summary>
     public IReadOnlyList<ContentBlock>? GetContentBlocks()
     {
-        if (Content.ValueKind == JsonValueKind.Array)
-        {
-            var blocks = new List<ContentBlock>();
-            foreach (var element in Content.EnumerateArray())
-            {
-                var block = JsonSerializer.Deserialize<ContentBlock>(element, ClaudeJsonContext.Default.ContentBlock);
-                if (block != null)
-                    blocks.Add(block);
-            }
-            return blocks;
-        }
-        return null;
+        if (Content.ValueKind != JsonValueKind.Array)
+            return null;
+        return Internal.MessageParser.ParseUserContentBlocks(Content);
     }
 }
 
@@ -437,6 +444,33 @@ public record ResultMessage : Message
     /// <summary>Unique ID for this result. Python commit 24b9b68.</summary>
     [JsonPropertyName("uuid")]
     public string? Uuid { get; init; }
+
+    /// <summary>
+    /// Per-model usage keyed by model id (the CLI's camelCase <c>modelUsage</c>).
+    /// Python: <c>ResultMessage.model_usage</c>.
+    /// </summary>
+    [JsonPropertyName("modelUsage")]
+    public IReadOnlyDictionary<string, ModelUsage>? ModelUsage { get; init; }
+
+    /// <summary>Tool calls denied during the run, passed through raw. Python: <c>permission_denials</c>.</summary>
+    [JsonPropertyName("permission_denials")]
+    public JsonElement? PermissionDenials { get; init; }
+
+    /// <summary>
+    /// Why the query loop terminated (e.g. <c>"completed"</c>,
+    /// <c>"max_turns"</c>, <c>"aborted_streaming"</c>); <c>null</c> when not
+    /// reported. Python: <c>ResultMessage.terminal_reason</c>.
+    /// </summary>
+    [JsonPropertyName("terminal_reason")]
+    public string? TerminalReason { get; init; }
+
+    /// <summary>
+    /// Origin of the user message that triggered this turn — lets a streaming
+    /// consumer tell the result of its own prompt from results of injected
+    /// turns. Python: <c>ResultMessage.origin</c>.
+    /// </summary>
+    [JsonPropertyName("origin")]
+    public MessageOrigin? Origin { get; init; }
 }
 
 /// <summary>
@@ -1162,8 +1196,9 @@ public record McpSdkServerConfig
 
 /// <summary>
 /// Configuration for using Claude Code's preset system prompt with optional additions.
+/// Python: <c>SystemPromptPreset</c>.
 /// </summary>
-public record SystemPromptPreset
+public record SystemPromptPreset : SystemPromptConfig
 {
     /// <summary>Type identifier. Always "preset" for preset system prompts.</summary>
     [JsonPropertyName("type")]
@@ -1186,6 +1221,21 @@ public record SystemPromptPreset
     public bool? ExcludeDynamicSections { get; init; }
 
     /// <summary>
+    /// Whether the session keeps the system prompt it recorded on its first
+    /// request. When true, every later request (including after resume) sends
+    /// the recorded prompt, so changing <see cref="Append"/> has no effect until
+    /// the session is compacted or a new session starts. When false, the prompt
+    /// is rebuilt on every request. When null it acts as true, except in bare
+    /// mode (<c>--bare</c>), where it acts as false. Sent as
+    /// <c>systemPromptSnapshot</c> on the initialize request. Requires Claude
+    /// Code CLI 2.1.257 or later. Python: <c>SystemPromptPreset.snapshot</c>.
+    /// </summary>
+    [JsonPropertyName("snapshot")]
+    public bool? Snapshot { get; init; }
+
+    internal override bool? SnapshotForInitialize => Snapshot;
+
+    /// <summary>
     /// Creates a Claude Code preset system prompt with the specified append text.
     /// </summary>
     public static SystemPromptPreset ClaudeCode(string? append = null) =>
@@ -1195,7 +1245,7 @@ public record SystemPromptPreset
 /// <summary>
 /// System prompt loaded from a file. Python commit 139b815.
 /// </summary>
-public record SystemPromptFile
+public record SystemPromptFile : SystemPromptConfig
 {
     /// <summary>Type identifier. Always "file".</summary>
     [JsonPropertyName("type")]
@@ -1240,8 +1290,19 @@ public record TaskBudget(
 /// Agent definition configuration. Expanded by Python commits 028d591,
 /// fad1b84, 7c6902b.
 /// </summary>
-/// <param name="Effort"><see cref="EffortLevel"/> or int (token budget); use object? to model the union.</param>
-/// <param name="McpServers">List of server names (string) or inline {name: config} dict (object).</param>
+/// <param name="Description">When to use this agent.</param>
+/// <param name="Prompt">The agent's system prompt.</param>
+/// <param name="Tools">Allowed tool names (passing "Skill" is deprecated; use <paramref name="Skills"/>).</param>
+/// <param name="Model">Model alias ("sonnet", "opus", "haiku", "inherit") or a full model ID.</param>
+/// <param name="DisallowedTools">Tool names the agent may not use.</param>
+/// <param name="Skills">Skills to enable for the agent.</param>
+/// <param name="Memory">"user", "project" or "local".</param>
+/// <param name="InitialPrompt">Prompt sent when the agent starts.</param>
+/// <param name="MaxTurns">Maximum turns for the agent.</param>
+/// <param name="Background">Run the agent in the background.</param>
+/// <param name="PermissionMode">Permission mode for the agent.</param>
+/// <param name="Effort">An <see cref="EffortLevel"/> or an int (Python <c>EffortLevel | int</c>); both convert implicitly.</param>
+/// <param name="McpServers">Server names or inline <c>{name: config}</c> maps (Python <c>list[str | dict]</c>); strings and dictionaries convert implicitly.</param>
 public record AgentDefinition(
     [property: JsonPropertyName("description")] string Description,
     [property: JsonPropertyName("prompt")] string Prompt,
@@ -1250,11 +1311,11 @@ public record AgentDefinition(
     [property: JsonPropertyName("disallowedTools")] IReadOnlyList<string>? DisallowedTools = null,
     [property: JsonPropertyName("skills")] IReadOnlyList<string>? Skills = null,
     [property: JsonPropertyName("memory")] string? Memory = null,
-    [property: JsonPropertyName("mcpServers")] IReadOnlyList<object>? McpServers = null,
+    [property: JsonPropertyName("mcpServers")] IReadOnlyList<AgentMcpServer>? McpServers = null,
     [property: JsonPropertyName("initialPrompt")] string? InitialPrompt = null,
     [property: JsonPropertyName("maxTurns")] int? MaxTurns = null,
     [property: JsonPropertyName("background")] bool? Background = null,
-    [property: JsonPropertyName("effort")] object? Effort = null,
+    [property: JsonPropertyName("effort")] AgentEffort? Effort = null,
     [property: JsonPropertyName("permissionMode")] PermissionMode? PermissionMode = null
 );
 
@@ -1425,11 +1486,19 @@ public record ClaudeAgentOptions
     /// <summary>Additional tools to allow.</summary>
     public IReadOnlyList<string> AllowedTools { get; init; } = [];
 
-    /// <summary>System prompt for the conversation. Can be a string or <see cref="SystemPromptPreset"/>.</summary>
-    public object? SystemPrompt { get; init; }
+    /// <summary>
+    /// System prompt configuration: a string, <see cref="SystemPromptPreset"/>,
+    /// <see cref="SystemPromptCustom"/> or <see cref="SystemPromptFile"/>.
+    /// <c>null</c> sends an empty system prompt (Python parity).
+    /// </summary>
+    public SystemPromptConfig? SystemPrompt { get; init; }
 
-    /// <summary>MCP server configurations (dict or path). Use <c>McpServers</c> helpers for in-process SDK servers.</summary>
-    public object? McpServers { get; init; }
+    /// <summary>
+    /// MCP server configurations: a name → config dictionary (see the
+    /// <c>McpServers</c> helpers for in-process SDK servers), or a path to an
+    /// MCP config file / JSON string.
+    /// </summary>
+    public McpServersConfig? McpServers { get; init; }
 
     /// <summary>Permission mode for tool execution.</summary>
     public PermissionMode? PermissionMode { get; init; }
@@ -1482,6 +1551,13 @@ public record ClaudeAgentOptions
     /// <summary>Maximum buffer size for CLI stdout.</summary>
     public int? MaxBufferSize { get; init; }
 
+    /// <summary>
+    /// Deprecated and no longer read by the transport (Python:
+    /// <c>debug_stderr</c>). Use <see cref="StderrCallback"/>.
+    /// </summary>
+    [Obsolete("No longer read by the transport. Use StderrCallback instead.")]
+    public TextWriter? DebugStderr { get; init; }
+
     /// <summary>Callback for stderr output from CLI.</summary>
     public Action<string>? StderrCallback { get; init; }
 
@@ -1499,6 +1575,44 @@ public record ClaudeAgentOptions
 
     /// <summary>Fork session when resuming.</summary>
     public bool ForkSession { get; init; }
+
+    /// <summary>
+    /// When resuming, only load the conversation up to and including the
+    /// message with this UUID. Use with <see cref="Resume"/> (and usually
+    /// <see cref="ForkSession"/>) to branch from an earlier point. Maps to
+    /// <c>--resume-session-at=&lt;uuid&gt;</c>. Python: <c>resume_session_at</c>.
+    /// </summary>
+    public string? ResumeSessionAt { get; init; }
+
+    /// <summary>
+    /// With <see cref="ResumeSessionAt"/>: the UUID of the user prompt whose
+    /// turn this truncating resume intends to discard. The CLI then refuses the
+    /// resume (surfacing as a <see cref="ProcessException"/> whose message
+    /// contains <c>Resume rejected by --resume-drops-turn:</c>) unless every
+    /// entry after the resume point belongs to that turn. An empty string is
+    /// forwarded (and rejected by the CLI) rather than silently disarming the
+    /// guard. Maps to <c>--resume-drops-turn=&lt;uuid&gt;</c>. Python:
+    /// <c>resume_drops_turn</c>.
+    /// </summary>
+    public string? ResumeDropsTurn { get; init; }
+
+    /// <summary>
+    /// Forward subagent text and thinking blocks as messages in the stream
+    /// (by default only tool_use / tool_result blocks from subagents are
+    /// emitted). Sent as <c>forwardSubagentText</c> on the initialize request.
+    /// Python: <c>forward_subagent_text</c>.
+    /// </summary>
+    public bool ForwardSubagentText { get; init; }
+
+    /// <summary>
+    /// Deliver every prompt to Claude as written: every user message the SDK
+    /// sends is marked <c>client_composed</c>, so the CLI performs no
+    /// <c>@path</c> file-mention expansion and no slash-command dispatch. Any
+    /// caller-supplied <c>client_composed</c> value is overwritten while this is
+    /// on. Requires Claude Code 2.1.248 or later (older versions ignore the
+    /// field; the SDK warns on connect). Python: <c>verbatim_prompts</c>.
+    /// </summary>
+    public bool VerbatimPrompts { get; init; }
 
     /// <summary>Agent definitions.</summary>
     public IReadOnlyDictionary<string, AgentDefinition>? Agents { get; init; }
@@ -1557,11 +1671,10 @@ public record ClaudeAgentOptions
     /// list of names = enable only those. Python commit 1c26bd3.
     /// </summary>
     /// <remarks>
-    /// Modeled as <see cref="object"/> to capture the Python
-    /// <c>list[str] | Literal["all"] | None</c> union. Use either a
-    /// <see cref="string"/> ("all") or <see cref="IReadOnlyList{T}"/> of string.
+    /// Python <c>list[str] | Literal["all"] | None</c>. Assign <c>"all"</c>,
+    /// a <see cref="List{T}"/> / array of names, or a <see cref="SkillsConfig"/>.
     /// </remarks>
-    public object? Skills { get; init; }
+    public SkillsConfig? Skills { get; init; }
 
     /// <summary>
     /// When true, only use MCP servers passed via <see cref="McpServers"/>,
@@ -1590,6 +1703,14 @@ public record ClaudeAgentOptions
     /// Ignored when <see cref="SessionStore"/> is null. Python commit 0a69e94.
     /// </summary>
     public SessionStoreFlushMode SessionStoreFlush { get; init; } = SessionStoreFlushMode.Batched;
+
+    /// <summary>
+    /// Timeout, in milliseconds, for each <see cref="ISessionStore"/> load /
+    /// list call during resume materialization. The query fails with a clear
+    /// error instead of hanging when the adapter doesn't settle in time. 0 (or
+    /// less) means an immediate timeout. Python: <c>load_timeout_ms</c>.
+    /// </summary>
+    public int LoadTimeoutMs { get; init; } = 60_000;
 }
 
 #endregion

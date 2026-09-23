@@ -120,33 +120,14 @@ public class ClaudeSDKClient : IAsyncDisposable
         IAsyncEnumerable<Dictionary<string, object?>>? promptStream,
         CancellationToken cancellationToken)
     {
-        // Validate permission settings
-        if (_options.CanUseTool != null)
-        {
-            if (prompt != null)
-            {
-                throw new ArgumentException(
-                    "can_use_tool callback requires streaming mode. " +   
-                    "Please provide prompt as null for interactive mode or use the stream overload."
-                );
-            }
-
-            if (_options.PermissionPromptToolName != null)
-            {
-                throw new ArgumentException(
-                    "can_use_tool callback cannot be used with permission_prompt_tool_name. " +
-                    "Please use one or the other."
-                );
-            }
-        }
-
         // Fail fast on invalid SessionStore option combinations before spawning.
         SessionStoreValidation.Validate(_options);
 
         // resume/continue + SessionStore: materialize the stored session into a
-        // temp CLAUDE_CONFIG_DIR (skipped for a custom transport).
+        // temp CLAUDE_CONFIG_DIR (skipped for a custom transport), honoring
+        // LoadTimeoutMs (Python: load_timeout_ms).
         _materialized = _customTransport == null
-            ? await SessionResume.MaterializeResumeSessionAsync(_options, cancellationToken)
+            ? await SessionStoreSupport.MaterializeAsync(_options, cancellationToken)
             : null;
 
         try
@@ -163,7 +144,7 @@ public class ClaudeSDKClient : IAsyncDisposable
         if (promptStream != null)
         {
             _inputTask = Task.Run(
-                () => _queryHandler.StreamInputAsync(promptStream, cancellationToken),
+                () => _queryHandler!.StreamInputAsync(promptStream, cancellationToken),
                 cancellationToken
             );
         }
@@ -176,11 +157,12 @@ public class ClaudeSDKClient : IAsyncDisposable
 
     private async Task ConnectCoreAsync(CancellationToken cancellationToken)
     {
-        // The transport adds `--permission-prompt-tool stdio` itself when
-        // CanUseTool is set, so the options are passed through unchanged.
-        var options = _materialized != null
-            ? SessionStoreSupport.ApplyMaterialized(_options, _materialized)
-            : _options;
+        // Validate and configure permission settings (Python:
+        // _configure_can_use_tool): rejects CanUseTool + PermissionPromptToolName,
+        // warns when the callback is shadowed, routes prompts over stdio.
+        var options = CanUseToolConfiguration.Configure(_options);
+        if (_materialized != null)
+            options = SessionStoreSupport.ApplyMaterialized(options, _materialized);
 
         // ClaudeSDKClient always uses streaming mode.
         _transport = _customTransport ?? new SubprocessTransport(CreateEmptyStream(), options);
@@ -203,19 +185,11 @@ public class ClaudeSDKClient : IAsyncDisposable
         if (_options.McpServers == null || _queryHandler == null)
             return;
 
-        // Check if McpServers is a dictionary
-        if (_options.McpServers is not Dictionary<string, object> servers)
-            return;
-
-        foreach (var (name, config) in servers)
+        foreach (var (name, sdkConfig) in _options.McpServers.SdkServers())
         {
-            // Check for SDK server configurations
-            if (config is McpSdkServerConfig sdkConfig)
-            {
-                var bridge = new SdkMcpBridge(sdkConfig.Handlers, name);
-                await bridge.StartAsync(cancellationToken);
-                _queryHandler.RegisterSdkMcpBridge(name, bridge);
-            }
+            var bridge = new SdkMcpBridge(sdkConfig.Handlers, name);
+            await bridge.StartAsync(cancellationToken);
+            _queryHandler.RegisterSdkMcpBridge(name, bridge);
         }
     }
 
@@ -273,15 +247,43 @@ public class ClaudeSDKClient : IAsyncDisposable
         if (_queryHandler == null || _transport == null)
             throw new CliConnectionException("Not connected. Call ConnectAsync() first.");
 
-        var message = new
+        var message = new Dictionary<string, object?>
         {
-            type = "user",
-            message = new { role = "user", content = prompt },
-            parent_tool_use_id = (string?)null,
-            session_id = sessionId
+            ["type"] = "user",
+            ["message"] = new Dictionary<string, object?> { ["role"] = "user", ["content"] = prompt },
+            ["parent_tool_use_id"] = null,
+            ["session_id"] = sessionId
         };
 
-        await _transport.WriteAsync(JsonSerializer.Serialize(message) + "\n", cancellationToken);
+        await _transport.WriteAsync(
+            JsonSerializer.Serialize(QueryHandler.StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// Send a stream of user messages in streaming mode. Each message missing a
+    /// <c>session_id</c> gets <paramref name="sessionId"/>; with
+    /// <see cref="ClaudeAgentOptions.VerbatimPrompts"/> every message is stamped
+    /// <c>client_composed</c>. The caller's dictionaries are not mutated.
+    /// Python: <c>ClaudeSDKClient.query(AsyncIterable)</c>.
+    /// </summary>
+    public async Task QueryAsync(
+        IAsyncEnumerable<Dictionary<string, object?>> prompt,
+        string sessionId = "default",
+        CancellationToken cancellationToken = default)
+    {
+        if (_queryHandler == null || _transport == null)
+            throw new CliConnectionException("Not connected. Call ConnectAsync() first.");
+
+        await foreach (var msg in prompt.WithCancellation(cancellationToken))
+        {
+            var message = msg;
+            if (!message.ContainsKey("session_id"))
+                message = new Dictionary<string, object?>(message) { ["session_id"] = sessionId };
+            await _transport.WriteAsync(
+                JsonSerializer.Serialize(QueryHandler.StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
+                cancellationToken);
+        }
     }
 
     /// <summary>
@@ -314,6 +316,13 @@ public class ClaudeSDKClient : IAsyncDisposable
 
         await _queryHandler.SetPermissionModeAsync(mode, cancellationToken);
     }
+
+    /// <summary>
+    /// Change permission mode during conversation (typed overload; Python's
+    /// <c>set_permission_mode</c> takes the <c>PermissionMode</c> literal).
+    /// </summary>
+    public Task SetPermissionModeAsync(PermissionMode mode, CancellationToken cancellationToken = default) =>
+        SetPermissionModeAsync(SubprocessTransport.PermissionModeToCliValue(mode), cancellationToken);
 
     /// <summary>
     /// Change the AI model during conversation.

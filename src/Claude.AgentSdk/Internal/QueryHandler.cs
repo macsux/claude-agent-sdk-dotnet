@@ -40,7 +40,9 @@ internal class QueryHandler : IAsyncDisposable
     // When the CLI emits a result with is_error=true and then exits non-zero,
     // the trailing ProcessError carries no information beyond "exit code N".
     // Replace it with the structured error the CLI already reported.
-    private string? _lastErrorResultText;
+    // Python keeps the whole result payload (self._last_error_result) so the
+    // replacement can be a typed ResultError rather than just a message.
+    private JsonElement? _lastErrorResult;
 
     // Python commit 2c29362: inflight server-initiated control requests so we
     // can cancel them on control_cancel_request.
@@ -163,11 +165,16 @@ internal class QueryHandler : IAsyncDisposable
             request["agents"] = BuildAgentsPayload(_options.Agents);
         if (_options.SystemPrompt is SystemPromptPreset { ExcludeDynamicSections: { } eds })
             request["excludeDynamicSections"] = eds;
+        // Python reads `snapshot` only from the preset and custom forms.
+        if (_options.SystemPrompt?.SnapshotForInitialize is { } snapshot)
+            request["systemPromptSnapshot"] = snapshot;
         // 'all' and omitted are equivalent at the wire level (no filter), so only
         // send the field when it's an explicit list.
         var skills = SubprocessTransport.NormalizeSkills(_options.Skills);
         if (skills != null)
             request["skills"] = skills;
+        if (_options.ForwardSubagentText)
+            request["forwardSubagentText"] = true;
 
         var response = await SendControlRequestAsync(request, _initializeTimeout, cancellationToken);
         _initialized = true;
@@ -195,12 +202,12 @@ internal class QueryHandler : IAsyncDisposable
             if (def.Model != null) d["model"] = def.Model;
             if (def.Skills != null) d["skills"] = def.Skills;
             if (def.Memory != null) d["memory"] = def.Memory;
-            if (def.McpServers != null) d["mcpServers"] = def.McpServers;
+            if (def.McpServers != null) d["mcpServers"] = def.McpServers.Select(s => s.ToWire()).ToList();
             if (def.InitialPrompt != null) d["initialPrompt"] = def.InitialPrompt;
             if (def.MaxTurns != null) d["maxTurns"] = def.MaxTurns;
             if (def.Background != null) d["background"] = def.Background;
             if (def.Effort != null)
-                d["effort"] = def.Effort is EffortLevel level ? level.ToJsonString() : def.Effort;
+                d["effort"] = def.Effort.ToWire();
             if (def.PermissionMode != null)
                 d["permissionMode"] = SubprocessTransport.PermissionModeToCliValue(def.PermissionMode.Value);
             result[name] = d;
@@ -315,33 +322,10 @@ internal class QueryHandler : IAsyncDisposable
 
                     // Python commit 9aafd84: remember the error text from the
                     // result, then suppress the trailing ProcessError below.
-                    if (message.TryGetProperty("is_error", out var isErr) &&
-                        isErr.ValueKind == JsonValueKind.True)
-                    {
-                        string? errorText = null;
-                        if (message.TryGetProperty("errors", out var errs) &&
-                            errs.ValueKind == JsonValueKind.Array)
-                        {
-                            var parts = new List<string>();
-                            foreach (var e in errs.EnumerateArray())
-                            {
-                                if (e.ValueKind == JsonValueKind.String)
-                                    parts.Add(e.GetString()!);
-                            }
-                            if (parts.Count > 0) errorText = string.Join("; ", parts);
-                        }
-                        if (string.IsNullOrEmpty(errorText) &&
-                            message.TryGetProperty("subtype", out var st) &&
-                            st.ValueKind == JsonValueKind.String)
-                        {
-                            errorText = st.GetString();
-                        }
-                        _lastErrorResultText = errorText ?? "unknown error";
-                    }
-                    else
-                    {
-                        _lastErrorResultText = null;
-                    }
+                    _lastErrorResult =
+                        message.TryGetProperty("is_error", out var isErr) && isErr.ValueKind == JsonValueKind.True
+                            ? message.Clone()
+                            : null;
                 }
                 else if (!(msgType == "system" &&
                            message.TryGetProperty("subtype", out var sst) &&
@@ -350,7 +334,7 @@ internal class QueryHandler : IAsyncDisposable
                 {
                     // Anything other than the post-turn session_state_changed marker
                     // means the conversation moved on; reset the suppression marker.
-                    _lastErrorResultText = null;
+                    _lastErrorResult = null;
                 }
 
                 // Regular SDK messages go to the stream
@@ -363,16 +347,15 @@ internal class QueryHandler : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Python commit 9aafd84: replace ProcessError with the structured error
-            // the CLI already reported, so the exception is actionable.
+            // When the CLI emits a result with is_error=true it then exits
+            // non-zero on purpose; the trailing ProcessException carries nothing
+            // beyond "exit code 1". Replace it with a ResultException carrying the
+            // result the CLI already reported (Python: Query._read_messages,
+            // ResultError). ResultException subclasses ProcessException.
             Exception finalEx = ex;
-            if (ex is ProcessException pex && _lastErrorResultText != null)
+            if (ex is ProcessException pex && ex is not ResultException && _lastErrorResult is { } lastError)
             {
-                finalEx = new ProcessException(
-                    $"Claude Code returned an error result: {_lastErrorResultText}",
-                    pex.ExitCode ?? -1,
-                    pex.Stderr ?? ""
-                );
+                finalEx = ResultException.FromResultFrame(lastError, pex.ExitCode, pex);
             }
             finalException = finalEx;
 
@@ -957,6 +940,20 @@ internal class QueryHandler : IAsyncDisposable
     }
 
     /// <summary>
+    /// Apply <see cref="ClaudeAgentOptions.VerbatimPrompts"/> to an outgoing
+    /// user message: returns <paramref name="message"/> unchanged when off,
+    /// otherwise a copy with <c>client_composed = true</c> (overwriting any
+    /// caller-supplied value; the caller's dictionary is never mutated).
+    /// Python: <c>stamp_user_message</c>.
+    /// </summary>
+    internal static Dictionary<string, object?> StampUserMessage(Dictionary<string, object?> message, bool verbatimPrompts)
+    {
+        if (!verbatimPrompts)
+            return message;
+        return new Dictionary<string, object?>(message) { ["client_composed"] = true };
+    }
+
+    /// <summary>
     /// Stream input messages to transport, then close stdin once the run ends.
     /// </summary>
     public async Task StreamInputAsync(
@@ -970,7 +967,9 @@ internal class QueryHandler : IAsyncDisposable
             {
                 if (_closed)
                     break;
-                await _transport.WriteAsync(JsonSerializer.Serialize(message) + "\n", cancellationToken);
+                await _transport.WriteAsync(
+                    JsonSerializer.Serialize(StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
+                    cancellationToken);
                 written++;
             }
         }

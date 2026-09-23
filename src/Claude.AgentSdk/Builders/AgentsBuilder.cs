@@ -21,6 +21,16 @@ public sealed class AgentsBuilder
         return this;
     }
 
+    /// <summary>
+    /// Add a fully specified agent definition (effort, MCP servers, skills,
+    /// permission mode, ...).
+    /// </summary>
+    public AgentsBuilder Add(string name, AgentDefinition definition)
+    {
+        _agents[name] = definition;
+        return this;
+    }
+
     internal IReadOnlyDictionary<string, AgentDefinition> Build()
     {
         return _agents.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
