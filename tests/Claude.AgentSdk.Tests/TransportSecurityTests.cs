@@ -113,11 +113,14 @@ public sealed class TransportSecurityTests
         Assert.Throws<ArgumentException>(() => transport.BuildCommand());
     }
 
+    // Python raises TypeError for a bare skill name (it would iterate as
+    // characters). With the typed SkillsConfig the rejection happens as soon as
+    // the string is converted, with the same "Did you mean" hint.
     [Fact]
-    public void BuildCommand_RejectsBareStringSkills()
+    public void Skills_RejectsBareStringOtherThanAll()
     {
-        var transport = MakeTransport(new ClaudeAgentOptions { Skills = "pdf" });
-        Assert.Throws<ArgumentException>(() => transport.BuildCommand());
+        var ex = Assert.Throws<ArgumentException>(() => new ClaudeAgentOptions { Skills = "pdf" });
+        Assert.Contains("Did you mean [\"pdf\"]?", ex.Message);
     }
 
     [Fact]

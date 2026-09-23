@@ -3,6 +3,7 @@
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -17,6 +18,13 @@ public class SubprocessTransport : ITransport
     private const int DefaultMaxBufferSize = 1024 * 1024; // 1MB
     private const int ReadChunkSize = 64 * 1024;
     private const string MinimumClaudeCodeVersion = "2.0.0";
+
+    /// <summary>
+    /// First Claude Code version that honors <c>client_composed</c> on user
+    /// messages, which <see cref="ClaudeAgentOptions.VerbatimPrompts"/> relies on.
+    /// Python: <c>VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION</c>.
+    /// </summary>
+    internal const string VerbatimPromptsMinimumClaudeCodeVersion = "2.1.248";
 
     // Python commit f2389ec: track live subprocesses so we can terminate them
     // when the parent process exits. Mirrors Python atexit cleanup.
@@ -336,27 +344,17 @@ public class SubprocessTransport : ITransport
     }
 
     /// <summary>
-    /// Reject <see cref="ClaudeAgentOptions.Skills"/> values other than a list of
-    /// names or "all" (a bare string other than "all" would otherwise be silently
-    /// ignored). Python: <c>_reject_non_list_skills</c>.
+    /// The explicit skill allowlist, or <c>null</c> for unset / <c>"all"</c>
+    /// ('all' and omitted are equivalent at the wire level: no filter). Bare
+    /// strings other than "all" are already rejected when converted to
+    /// <see cref="SkillsConfig"/> (Python: <c>_reject_non_list_skills</c>).
     /// </summary>
-    internal static IReadOnlyList<string>? NormalizeSkills(object? skills)
+    internal static IReadOnlyList<string>? NormalizeSkills(SkillsConfig? skills) => skills switch
     {
-        switch (skills)
-        {
-            case null:
-            case "all":
-                return null;
-            case string s:
-                throw new ArgumentException(
-                    $"ClaudeAgentOptions.Skills must be a list of skill names or \"all\", got \"{s}\". Did you mean [\"{s}\"]?");
-            case IEnumerable<string> names:
-                return names.ToList();
-            default:
-                throw new ArgumentException(
-                    $"ClaudeAgentOptions.Skills must be a list of skill names or \"all\", got {skills.GetType().Name}.");
-        }
-    }
+        SkillsConfig.Named named => named.Names ?? throw new ArgumentException(
+            "ClaudeAgentOptions.Skills must be a list of skill names or \"all\", got null."),
+        _ => null
+    };
 
     /// <summary>
     /// Python commit 1c26bd3 + e621929: compute effective allowed_tools and
@@ -399,12 +397,18 @@ public class SubprocessTransport : ITransport
         return (allowedTools, settingSources);
     }
 
+    /// <summary>
+    /// CLI value for a permission mode. Covers every Python <c>PermissionMode</c>
+    /// literal, including <c>dontAsk</c> and <c>auto</c>.
+    /// </summary>
     internal static string PermissionModeToCliValue(PermissionMode mode) => mode switch
     {
         PermissionMode.Default => "default",
         PermissionMode.AcceptEdits => "acceptEdits",
         PermissionMode.Plan => "plan",
         PermissionMode.BypassPermissions => "bypassPermissions",
+        PermissionMode.DontAsk => "dontAsk",
+        PermissionMode.Auto => "auto",
         _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, "Unsupported permission mode")
     };
 
@@ -465,26 +469,27 @@ public class SubprocessTransport : ITransport
         _cliPath ??= FindCli();
         var cmd = new List<string> { _cliPath, "--output-format", "stream-json", "--verbose" };
 
-        // System prompt
-        if (_options.SystemPrompt == null)
+        // System prompt (Python _build_command). The preset's
+        // exclude_dynamic_sections / snapshot and the custom form's snapshot
+        // ride in the initialize request, never on argv.
+        switch (_options.SystemPrompt)
         {
-            cmd.AddRange(["--system-prompt", ""]);
-        }
-        else if (_options.SystemPrompt is SystemPromptPreset preset)
-        {
-            if (preset.Append is not null)
-            {
-                cmd.AddRange(["--append-system-prompt", preset.Append]);
-            }
-        }
-        else if (_options.SystemPrompt is SystemPromptFile spFile)
-        {
-            // Python commit reference: SystemPromptFile branch in subprocess_cli.py
-            cmd.AddRange(["--system-prompt-file", spFile.Path]);
-        }
-        else
-        {
-            cmd.AddRange(["--system-prompt", _options.SystemPrompt.ToString() ?? ""]);
+            case null:
+                cmd.AddRange(["--system-prompt", ""]);
+                break;
+            case SystemPromptText text:
+                cmd.AddRange(["--system-prompt", text.Text]);
+                break;
+            case SystemPromptFile spFile:
+                cmd.AddRange(["--system-prompt-file", spFile.Path]);
+                break;
+            case SystemPromptCustom custom:
+                // The custom form reaches the CLI the same way a plain string does.
+                cmd.AddRange(["--system-prompt", custom.Prompt]);
+                break;
+            case SystemPromptPreset { Append: { } append }:
+                cmd.AddRange(["--append-system-prompt", append]);
+                break;
         }
 
         // Tools
@@ -501,26 +506,31 @@ public class SubprocessTransport : ITransport
             cmd.AddRange(["--tools", "default"]);
         }
 
-        if (_options.AllowedTools.Count > 0)
-            cmd.AddRange(["--allowedTools", string.Join(",", _options.AllowedTools)]);
+        // Python commit 1c26bd3 + e621929: effective allowedTools and
+        // setting-sources account for the Skills option.
+        var (effectiveAllowedTools, effectiveSettingSources) = ApplySkillsDefaults();
 
-        if (_options.MaxTurns.HasValue)
-            cmd.AddRange(["--max-turns", _options.MaxTurns.Value.ToString()]);
+        if (effectiveAllowedTools.Count > 0)
+            cmd.AddRange(["--allowedTools", string.Join(",", effectiveAllowedTools)]);
+
+        // Python: `if self._options.max_turns:` -- 0 is omitted.
+        if (_options.MaxTurns is { } maxTurns and not 0)
+            cmd.AddRange(["--max-turns", maxTurns.ToString(CultureInfo.InvariantCulture)]);
 
         if (_options.MaxBudgetUsd.HasValue)
-            cmd.AddRange(["--max-budget-usd", _options.MaxBudgetUsd.Value.ToString()]);
+            cmd.AddRange(["--max-budget-usd", _options.MaxBudgetUsd.Value.ToString(CultureInfo.InvariantCulture)]);
 
         if (_options.DisallowedTools.Count > 0)
             cmd.AddRange(["--disallowedTools", string.Join(",", _options.DisallowedTools)]);
 
         // Python commit 2e60cec: --task-budget <total>.
         if (_options.TaskBudget != null)
-            cmd.AddRange(["--task-budget", _options.TaskBudget.Total.ToString()]);
+            cmd.AddRange(["--task-budget", _options.TaskBudget.Total.ToString(CultureInfo.InvariantCulture)]);
 
-        if (_options.Model != null)
+        if (!string.IsNullOrEmpty(_options.Model))
             cmd.AddRange(["--model", _options.Model]);
 
-        if (_options.FallbackModel != null)
+        if (!string.IsNullOrEmpty(_options.FallbackModel))
             cmd.AddRange(["--fallback-model", _options.FallbackModel]);
 
         if (_options.Betas.Count > 0)
@@ -564,16 +574,17 @@ public class SubprocessTransport : ITransport
         foreach (var dir in _options.AddDirs)
             cmd.AddRange(["--add-dir", dir]);
 
-        // MCP servers
-        if (_options.McpServers != null)
+        // MCP servers. Python: `if self._options.mcp_servers:` -- an empty map
+        // (or empty path) emits nothing.
+        switch (_options.McpServers)
         {
-            if (_options.McpServers is Dictionary<string, object> servers)
+            case McpServersConfig.ServerMap { Servers.Count: > 0 } map:
             {
                 // Strip the "instance" field from SDK server configs before
                 // serializing — the live SdkMcpServerConfig.Handlers list is
                 // delegate state that must not cross the process boundary.
                 var serversForCli = new Dictionary<string, object>();
-                foreach (var (name, config) in servers)
+                foreach (var (name, config) in map.Servers)
                 {
                     if (config is McpSdkServerConfig sdk)
                     {
@@ -590,11 +601,12 @@ public class SubprocessTransport : ITransport
                 }
                 var mcpConfig = new { mcpServers = serversForCli };
                 cmd.AddRange(["--mcp-config", JsonSerializer.Serialize(mcpConfig)]);
+                break;
             }
-            else
-            {
-                cmd.AddRange(["--mcp-config", _options.McpServers.ToString()!]);
-            }
+            case McpServersConfig.ConfigPath { Value.Length: > 0 } path:
+                // String or path form: passed through as a file path or JSON string.
+                cmd.AddRange(["--mcp-config", path.Value]);
+                break;
         }
 
         if (_options.IncludePartialMessages)
@@ -611,28 +623,29 @@ public class SubprocessTransport : ITransport
         if (_options.ForkSession)
             cmd.Add("--fork-session");
 
+        // Equals form so the value can never be parsed as a separate flag, even
+        // if the CLI's declaration of these options ever changes (Python parity).
+        if (!string.IsNullOrEmpty(_options.ResumeSessionAt))
+        {
+            RejectWindowsCmdMetacharacters("ResumeSessionAt", _options.ResumeSessionAt, OperatingSystem.IsWindows());
+            cmd.Add($"--resume-session-at={_options.ResumeSessionAt}");
+        }
+
+        // `is not null`, not truthiness: an empty string is forwarded so the CLI
+        // rejects it as a malformed declaration instead of the SDK silently
+        // disarming the guard the caller believes is armed (Python parity).
+        if (_options.ResumeDropsTurn is not null)
+        {
+            RejectWindowsCmdMetacharacters("ResumeDropsTurn", _options.ResumeDropsTurn, OperatingSystem.IsWindows());
+            cmd.Add($"--resume-drops-turn={_options.ResumeDropsTurn}");
+        }
+
         // Python commit 6e3d54f: session mirroring flag (paired with SessionStore).
         if (_options.SessionStore != null)
             cmd.Add("--session-mirror");
 
         // Agents are sent via the initialize request body, not as a CLI flag
         // (Python commit 7c6902b — matches TypeScript SDK). See QueryHandler.InitializeAsync.
-
-        // Python commit 1c26bd3 + e621929: compute effective allowedTools and
-        // setting-sources from skills configuration.
-        var (effectiveAllowedTools, effectiveSettingSources) = ApplySkillsDefaults();
-
-        // Replace the simple --allowedTools above with the skill-aware version.
-        // (We already emitted --allowedTools earlier from _options.AllowedTools;
-        // detect+rewrite here to keep parity with Python.)
-        var allowedIdx = cmd.IndexOf("--allowedTools");
-        if (effectiveAllowedTools.Count > 0)
-        {
-            if (allowedIdx >= 0 && allowedIdx + 1 < cmd.Count)
-                cmd[allowedIdx + 1] = string.Join(",", effectiveAllowedTools);
-            else
-                cmd.AddRange(["--allowedTools", string.Join(",", effectiveAllowedTools)]);
-        }
 
         if (effectiveSettingSources != null)
         {
@@ -646,6 +659,8 @@ public class SubprocessTransport : ITransport
         {
             if (plugin.Type == "local")
                 cmd.AddRange(["--plugin-dir", plugin.Path]);
+            else
+                throw new ArgumentException($"Unsupported plugin type: {plugin.Type}"); // Python: ValueError
         }
 
         foreach (var (flag, value) in _options.ExtraArgs)
@@ -1103,6 +1118,11 @@ public class SubprocessTransport : ITransport
                         );
                     }
                 }
+
+                var verbatimWarning = GetVerbatimPromptsVersionWarning(
+                    _options.VerbatimPrompts, match.Groups[1].Value, _cliPath);
+                if (verbatimWarning != null)
+                    Console.Error.WriteLine($"Warning: {verbatimWarning}");
             }
         }
         catch (Exception)
@@ -1118,6 +1138,24 @@ public class SubprocessTransport : ITransport
                 process.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Warning for <see cref="ClaudeAgentOptions.VerbatimPrompts"/> on a CLI that
+    /// predates <c>client_composed</c> (and so still expands <c>@path</c>
+    /// mentions and dispatches slash commands), or <c>null</c>. Python:
+    /// <c>_check_claude_version</c> with
+    /// <c>VERBATIM_PROMPTS_MINIMUM_CLAUDE_CODE_VERSION</c>.
+    /// </summary>
+    internal static string? GetVerbatimPromptsVersionWarning(bool verbatimPrompts, string cliVersion, string? cliPath)
+    {
+        if (!verbatimPrompts || !Version.TryParse(cliVersion, out var version))
+            return null;
+        if (version >= Version.Parse(VerbatimPromptsMinimumClaudeCodeVersion))
+            return null;
+        return $"VerbatimPrompts is enabled, but Claude Code version {cliVersion} at {cliPath} ignores it: " +
+               "prompts will still have @path mentions expanded and slash commands dispatched. " +
+               $"Claude Code {VerbatimPromptsMinimumClaudeCodeVersion} or later is required.";
     }
 
     [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]

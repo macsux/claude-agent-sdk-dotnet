@@ -140,7 +140,12 @@ public enum RateLimitStatus
 {
     Allowed,
     AllowedWarning,
-    Rejected
+    Rejected,
+    /// <summary>
+    /// A status this SDK version doesn't recognize (see <see cref="RateLimitInfo.Raw"/>).
+    /// Python passes the raw value through rather than failing the stream.
+    /// </summary>
+    Unknown
 }
 
 /// <summary>Rate limit window types.</summary>
@@ -560,6 +565,67 @@ public record PostToolUseHookSpecificOutput
     /// <summary>Replaces the output for MCP tools only. Prefer UpdatedToolOutput. Python commit b0b652f.</summary>
     [JsonPropertyName("updatedMCPToolOutput")]
     public JsonElement? UpdatedMCPToolOutput { get; init; }
+}
+
+/// <summary>Hook-specific output for PostToolUseFailure events. Python: <c>PostToolUseFailureHookSpecificOutput</c>.</summary>
+public record PostToolUseFailureHookSpecificOutput
+{
+    [JsonPropertyName("hookEventName")]
+    public string HookEventName => "PostToolUseFailure";
+
+    [JsonPropertyName("additionalContext")]
+    public string? AdditionalContext { get; init; }
+}
+
+/// <summary>Hook-specific output for UserPromptSubmit events. Python: <c>UserPromptSubmitHookSpecificOutput</c>.</summary>
+public record UserPromptSubmitHookSpecificOutput
+{
+    [JsonPropertyName("hookEventName")]
+    public string HookEventName => "UserPromptSubmit";
+
+    [JsonPropertyName("additionalContext")]
+    public string? AdditionalContext { get; init; }
+}
+
+/// <summary>Hook-specific output for SessionStart events. Python: <c>SessionStartHookSpecificOutput</c>.</summary>
+public record SessionStartHookSpecificOutput
+{
+    [JsonPropertyName("hookEventName")]
+    public string HookEventName => "SessionStart";
+
+    [JsonPropertyName("additionalContext")]
+    public string? AdditionalContext { get; init; }
+}
+
+/// <summary>Hook-specific output for Notification events. Python: <c>NotificationHookSpecificOutput</c>.</summary>
+public record NotificationHookSpecificOutput
+{
+    [JsonPropertyName("hookEventName")]
+    public string HookEventName => "Notification";
+
+    [JsonPropertyName("additionalContext")]
+    public string? AdditionalContext { get; init; }
+}
+
+/// <summary>Hook-specific output for SubagentStart events. Python: <c>SubagentStartHookSpecificOutput</c>.</summary>
+public record SubagentStartHookSpecificOutput
+{
+    [JsonPropertyName("hookEventName")]
+    public string HookEventName => "SubagentStart";
+
+    [JsonPropertyName("additionalContext")]
+    public string? AdditionalContext { get; init; }
+}
+
+/// <summary>Hook-specific output for PermissionRequest events. Python: <c>PermissionRequestHookSpecificOutput</c>.</summary>
+public record PermissionRequestHookSpecificOutput
+{
+    [JsonPropertyName("hookEventName")]
+    public string HookEventName => "PermissionRequest";
+
+    /// <summary>The permission decision object, passed to the CLI as-is.</summary>
+    [JsonPropertyName("decision")]
+    public required JsonElement Decision { get; init; }
 }
 
 #endregion

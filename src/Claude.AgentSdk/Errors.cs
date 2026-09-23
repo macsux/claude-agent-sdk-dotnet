@@ -52,6 +52,14 @@ public class ProcessException : ClaudeSDKException
         Stderr = stderr;
     }
 
+    /// <summary>Same as the primary constructor, chaining <paramref name="innerException"/>.</summary>
+    public ProcessException(string message, int? exitCode, string? stderr, Exception? innerException)
+        : base(FormatMessage(message, exitCode, stderr), innerException!)
+    {
+        ExitCode = exitCode;
+        Stderr = stderr;
+    }
+
     private static string FormatMessage(string message, int? exitCode, string? stderr)
     {
         if (exitCode.HasValue)
@@ -93,18 +101,86 @@ public class ResultException : ProcessException
     /// </summary>
     public IReadOnlyList<string> Errors { get; }
 
+    /// <summary>The result text, if any. For API failures this holds the "API Error: ..." prose.</summary>
+    public string? Result { get; init; }
+
+    /// <summary>HTTP status of the failing API call, if any.</summary>
+    public int? ApiErrorStatus { get; init; }
+
+    /// <summary>Session the result belongs to, if reported.</summary>
+    public string? SessionId { get; init; }
+
+    /// <summary>The raw <c>result</c> message payload as emitted by the CLI.</summary>
+    public JsonElement? RawResult { get; init; }
+
     public ResultException(
         string message,
         string subtype,
         string? terminalReason = null,
         IReadOnlyList<string>? errors = null,
         int? exitCode = null,
-        string? stderr = null)
-        : base(message, exitCode, stderr)
+        string? stderr = null,
+        Exception? innerException = null)
+        : base(message, exitCode, stderr, innerException)
     {
         Subtype = subtype;
         TerminalReason = terminalReason;
         Errors = errors ?? Array.Empty<string>();
+    }
+
+    /// <summary>
+    /// Build from a <c>result</c> frame with <c>is_error: true</c>, the way
+    /// Python's <c>Query._read_messages</c> replaces the trailing
+    /// <c>ProcessError</c>: message <c>"Claude Code returned an error result: …"</c>,
+    /// exit code carried over, stderr deliberately dropped (the transport's
+    /// value is a generic placeholder; the result text is the real cause).
+    /// </summary>
+    internal static ResultException FromResultFrame(JsonElement data, int? exitCode, Exception? cause)
+    {
+        static string? Str(JsonElement e, string name) =>
+            e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        var errors = data.TryGetProperty("errors", out var raw) ? NormalizeErrors(raw) : Array.Empty<string>();
+        int? status = data.TryGetProperty("api_error_status", out var s) && s.ValueKind == JsonValueKind.Number &&
+                      s.TryGetInt32(out var si)
+            ? si
+            : null;
+
+        return new ResultException(
+            $"Claude Code returned an error result: {ErrorResultText(data)}",
+            Str(data, "subtype") ?? string.Empty,
+            Str(data, "terminal_reason"),
+            errors,
+            exitCode,
+            stderr: null,
+            innerException: cause)
+        {
+            Result = Str(data, "result"),
+            ApiErrorStatus = status,
+            SessionId = Str(data, "session_id"),
+            RawResult = data.Clone()
+        };
+    }
+
+    /// <summary>
+    /// Pick the most informative text from an error <c>result</c> frame:
+    /// <c>errors[]</c>, then <c>result</c>, then a non-success <c>subtype</c>,
+    /// then the HTTP status. Python: <c>_error_result_text</c>.
+    /// </summary>
+    internal static string ErrorResultText(JsonElement data)
+    {
+        var errors = data.TryGetProperty("errors", out var raw) ? NormalizeErrors(raw) : Array.Empty<string>();
+        if (errors.Count > 0)
+            return string.Join("; ", errors);
+        if (data.TryGetProperty("result", out var r) && r.ValueKind == JsonValueKind.String &&
+            !string.IsNullOrWhiteSpace(r.GetString()))
+            return r.GetString()!.Trim();
+        if (data.TryGetProperty("subtype", out var st) && st.ValueKind == JsonValueKind.String &&
+            st.GetString() is { Length: > 0 } subtype && subtype != "success")
+            return subtype;
+        if (data.TryGetProperty("api_error_status", out var status) && status.ValueKind != JsonValueKind.Null)
+            return $"API error (HTTP {status.GetRawText()})";
+        return "unknown error";
     }
 
     /// <summary>

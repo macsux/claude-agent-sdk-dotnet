@@ -104,19 +104,20 @@ public sealed class StreamingClientTests
     }
 
     [Fact]
-    public async Task Client_CanUseTool_WithPrompt_ThrowsOnConnect()
+    public async Task Client_CanUseTool_WithStringPrompt_IsAllowed()
     {
-        // CanUseTool requires streaming mode; providing a prompt is not allowed
+        // The client always runs in streaming mode, so a string prompt is just the
+        // first user message; Python's _configure_can_use_tool no longer rejects it.
         var options = new ClaudeAgentOptions
         {
             CanUseTool = (_, _, _, _) => Task.FromResult<PermissionResult>(new PermissionResultAllow())
         };
+        var transport = new FakeTransport();
+        await using var client = new ClaudeSDKClient(options, transport);
 
-        var client = new ClaudeSDKClient(options);
+        await client.ConnectAsync("Hello");
 
-        // Connecting with a prompt and CanUseTool should throw ArgumentException
-        await Assert.ThrowsAsync<ArgumentException>(
-            () => client.ConnectAsync("Hello"));
+        Assert.Contains(transport.Written, w => w.GetProperty("type").GetString() == "user");
     }
 
     [Fact]

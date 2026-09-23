@@ -142,6 +142,49 @@ public record MessageOrigin
     public string? Name { get; init; }
 
     /// <summary>
+    /// kind == "peer": the sender's host-openable session id, if its host
+    /// provided one. A navigation target only.
+    /// </summary>
+    [JsonPropertyName("fromSession")]
+    public string? FromSession { get; init; }
+
+    /// <summary>
+    /// kind == "peer"/"observer": task id of the in-process background subagent
+    /// that sent this message. Absent for cross-session peers.
+    /// </summary>
+    [JsonPropertyName("senderTaskId")]
+    public string? SenderTaskId { get; init; }
+
+    /// <summary>
+    /// kind == "peer": decoded message body with the peer envelope stripped
+    /// (byte-exact with what the model saw).
+    /// </summary>
+    [JsonPropertyName("body")]
+    public string? Body { get; init; }
+
+    /// <summary>
+    /// kind == "peer": kernel-verified pid of the process that connected to this
+    /// session's local messaging socket. Absent when unverifiable.
+    /// </summary>
+    [JsonPropertyName("verifiedPeerPid")]
+    public long? VerifiedPeerPid { get; init; }
+
+    /// <summary>
+    /// kind == "task-notification": one of <see cref="TaskNotificationOriginSubkind"/>
+    /// when the delivery is a scheduled-task prompt or a message from another
+    /// of the user's sessions.
+    /// </summary>
+    [JsonPropertyName("subkind")]
+    public string? Subkind { get; init; }
+
+    /// <summary>
+    /// Keys this SDK version doesn't model. Python passes the origin dict
+    /// through as-is, so newer CLI fields stay visible here.
+    /// </summary>
+    [JsonExtensionData]
+    public Dictionary<string, JsonElement>? AdditionalProperties { get; init; }
+
+    /// <summary>
     /// True only for an explicitly human-originated message. An unrecognized
     /// kind is not human, which is the upstream-documented default.
     /// </summary>
@@ -186,6 +229,20 @@ public record ModelUsage
 
     [JsonPropertyName("maxOutputTokens")]
     public int MaxOutputTokens { get; init; }
+
+    /// <summary>
+    /// Canonical model id used for the pricing lookup (e.g. <c>claude-opus-4-7</c>);
+    /// may differ from the raw model string this entry is keyed by.
+    /// </summary>
+    [JsonPropertyName("canonicalModel")]
+    public string? CanonicalModel { get; init; }
+
+    /// <summary>
+    /// API provider that served this model (<c>firstParty</c>, <c>bedrock</c>,
+    /// <c>vertex</c>, <c>foundry</c>, ...).
+    /// </summary>
+    [JsonPropertyName("provider")]
+    public string? Provider { get; init; }
 }
 
 #endregion
@@ -201,7 +258,7 @@ public record ModelUsage
 /// subsequent ResultMessages. If you accumulate those totals across a long-lived
 /// session, snapshot them when this arrives.
 /// </remarks>
-public record ConversationResetMessage
+public record ConversationResetMessage : Message
 {
     /// <summary>
     /// Identifier for the fresh conversation. This is not the SessionId of

@@ -33,17 +33,14 @@ public static class Claude
         QueryHandler queryHandler,
         CancellationToken cancellationToken)
     {
-        if (options.McpServers is not Dictionary<string, object> servers)
+        if (options.McpServers is null)
             return;
 
-        foreach (var (name, config) in servers)
+        foreach (var (name, sdkConfig) in options.McpServers.SdkServers())
         {
-            if (config is McpSdkServerConfig sdkConfig)
-            {
-                var bridge = new SdkMcpBridge(sdkConfig.Handlers, name);
-                await bridge.StartAsync(cancellationToken);
-                queryHandler.RegisterSdkMcpBridge(name, bridge);
-            }
+            var bridge = new SdkMcpBridge(sdkConfig.Handlers, name);
+            await bridge.StartAsync(cancellationToken);
+            queryHandler.RegisterSdkMcpBridge(name, bridge);
         }
     }
 
@@ -159,13 +156,14 @@ public static class Claude
         // temp CLAUDE_CONFIG_DIR for the subprocess to resume from. Skipped for a
         // custom transport, which never sees the materialized options.
         var materialized = transport == null
-            ? await SessionResume.MaterializeResumeSessionAsync(options, cancellationToken)
+            ? await SessionStoreSupport.MaterializeAsync(options, cancellationToken)
             : null;
         try
         {
-            var configured = materialized != null
-                ? SessionStoreSupport.ApplyMaterialized(options, materialized)
-                : options;
+            // Validate and configure permission settings (Python: _configure_can_use_tool).
+            var configured = CanUseToolConfiguration.Configure(options);
+            if (materialized != null)
+                configured = SessionStoreSupport.ApplyMaterialized(configured, materialized);
 
             transport ??= new SubprocessTransport(prompt, configured);
             await transport.ConnectAsync(cancellationToken);
