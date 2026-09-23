@@ -41,7 +41,7 @@ internal sealed class RecordingTransport : ITransport
         _inner = new SubprocessTransport(prompt: "", options);
         _fixtureName = fixtureName;
         _model = options.Model ?? "";
-        _scrubber = new FixtureScrubber(options.Cwd ?? Environment.CurrentDirectory);
+        _scrubber = new FixtureScrubber(options.Cwd ?? Environment.CurrentDirectory, options.Agents?.Keys);
         Directory.CreateDirectory(directory);
         _path = Path.Combine(directory, fixtureName + ".jsonl");
     }
@@ -71,8 +71,27 @@ internal sealed class RecordingTransport : ITransport
     public async IAsyncEnumerable<JsonElement> ReadMessagesAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        await foreach (var msg in _inner.ReadMessagesAsync(cancellationToken))
+        await using var e = _inner.ReadMessagesAsync(cancellationToken).GetAsyncEnumerator(cancellationToken);
+        while (true)
         {
+            JsonElement msg;
+            try
+            {
+                if (!await e.MoveNextAsync()) break;
+                msg = e.Current;
+            }
+            catch (ProcessException ex)
+            {
+                // The CLI exited non-zero (e.g. after an error result): record it so the
+                // replay can raise the same failure at the same point.
+                Capture(new JsonObject
+                {
+                    ["dir"] = "exit",
+                    ["exit_code"] = ex.ExitCode,
+                    ["error"] = "Command failed",
+                });
+                throw;
+            }
             Capture(new JsonObject { ["dir"] = "in", ["msg"] = JsonNode.Parse(msg.GetRawText()) });
             yield return msg;
         }
@@ -111,7 +130,7 @@ internal sealed class RecordingTransport : ITransport
         };
         sb.Append(header.ToJsonString(WriteOptions)).Append('\n');
         foreach (var line in lines)
-            sb.Append(_scrubber.Scrub(line)!.ToJsonString(WriteOptions)).Append('\n');
+            sb.Append(_scrubber.ScrubLine(line).ToJsonString(WriteOptions)).Append('\n');
         File.WriteAllText(_path, sb.ToString());
     }
 }

@@ -28,7 +28,21 @@ internal sealed partial class FixtureScrubber
         "apiKeySource", "api_key_source",
         "messaging_socket_path",
         "oauthAccount",
+        "organization", "subscriptionType",
     };
+
+    // Built-in CLI agents. Other entries in the "agents" lists of the initialize response
+    // and init message come from the recording developer's environment (plugins, managed
+    // settings) and are dropped; SDK-defined agents are kept via the constructor argument.
+    private static readonly HashSet<string> BuiltInAgents = new(StringComparer.Ordinal)
+    {
+        "general-purpose", "Explore", "Plan", "statusline-setup", "claude-code-guide",
+    };
+
+    // Long catalog lists are truncated to keep fixtures small and environment-neutral.
+    private const int MaxCatalogEntries = 5;
+
+    private readonly HashSet<string> _keepAgents;
 
     [GeneratedRegex(@"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")]
     private static partial Regex EmailRegex();
@@ -39,8 +53,9 @@ internal sealed partial class FixtureScrubber
 
     private readonly List<(string From, string To)> _replacements = new();
 
-    public FixtureScrubber(string cwd)
+    public FixtureScrubber(string cwd, IEnumerable<string>? sdkAgents = null)
     {
+        _keepAgents = new HashSet<string>(BuiltInAgents.Concat(sdkAgents ?? []), StringComparer.Ordinal);
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         foreach (var c in DistinctPaths(cwd))
         {
@@ -82,6 +97,47 @@ internal sealed partial class FixtureScrubber
         s = EmailRegex().Replace(s, "user@example.com");
         s = ApiRequestIdRegex().Replace(s, "req_redacted");
         return s;
+    }
+
+    /// <summary>
+    /// Scrub one recorded line and curate the environment catalogs it may carry
+    /// (initialize response: commands / agents; init message: slash_commands / skills /
+    /// agents): truncate long lists, drop agents that are neither built in nor SDK-defined.
+    /// </summary>
+    public JsonObject ScrubLine(JsonObject line)
+    {
+        var scrubbed = (JsonObject)Scrub(line)!;
+        if (scrubbed["msg"] is not JsonObject msg) return scrubbed;
+
+        if (msg["type"]?.GetValue<string>() == "control_response" &&
+            msg["response"]?["response"] is JsonObject init && init.ContainsKey("commands"))
+        {
+            Truncate(init, "commands");
+            FilterAgents(init["agents"] as JsonArray, a => (a as JsonObject)?["name"]?.GetValue<string>());
+        }
+        else if (msg["type"]?.GetValue<string>() == "system" && msg["subtype"]?.GetValue<string>() == "init")
+        {
+            Truncate(msg, "slash_commands");
+            Truncate(msg, "skills");
+            FilterAgents(msg["agents"] as JsonArray, a => a?.GetValue<string>());
+        }
+        return scrubbed;
+    }
+
+    private static void Truncate(JsonObject obj, string key)
+    {
+        if (obj[key] is not JsonArray arr) return;
+        while (arr.Count > MaxCatalogEntries) arr.RemoveAt(arr.Count - 1);
+    }
+
+    private void FilterAgents(JsonArray? agents, Func<JsonNode?, string?> name)
+    {
+        if (agents is null) return;
+        for (var i = agents.Count - 1; i >= 0; i--)
+        {
+            if (name(agents[i]) is not { } n || !_keepAgents.Contains(n))
+                agents.RemoveAt(i);
+        }
     }
 
     /// <summary>Returns a scrubbed copy of <paramref name="node"/> (the input is not modified).</summary>
