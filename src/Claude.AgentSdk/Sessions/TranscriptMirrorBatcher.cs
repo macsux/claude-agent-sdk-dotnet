@@ -47,7 +47,6 @@ public sealed class TranscriptMirrorBatcher : IAsyncDisposable
     private readonly ISessionStore _store;
     private readonly string _projectsDir;
     private readonly MirrorErrorCallback _onError;
-    private readonly SemaphoreSlim _flushLock = new(1, 1);
 
     private record struct MirrorEntry(string FilePath, IReadOnlyList<SessionStoreEntry> Entries, int Bytes);
 
@@ -55,7 +54,12 @@ public sealed class TranscriptMirrorBatcher : IAsyncDisposable
     private List<MirrorEntry> _pending = new();
     private int _pendingEntries;
     private int _pendingBytes;
-    private Task? _flushTask;
+    // Tail of the drain chain. Each drain detaches the pending buffer and
+    // links itself behind the previous drain atomically (under _gate), so
+    // store appends happen in exactly detach order: the .NET equivalent of
+    // Python's FIFO anyio.Lock acquired with no await between detach and
+    // acquire. Never faults.
+    private Task _tail = Task.CompletedTask;
     private int _disposed;
 
     /// <summary>Per-append timeout (default 60s).</summary>
@@ -98,18 +102,20 @@ public sealed class TranscriptMirrorBatcher : IAsyncDisposable
         }
         if (overflow)
         {
-            // Fire-and-forget; the lock inside DrainAsync serializes against any in-flight flush.
-            _flushTask = Task.Run(() => DrainAsync());
+            // Detach + chain synchronously (ordering); run off the caller's
+            // thread (fire-and-forget, so a slow adapter never stalls the
+            // read loop).
+            var (items, prev, done) = DetachAndChain();
+            _ = Task.Run(() => RunDrainAsync(items, prev, done, CancellationToken.None));
         }
     }
 
-    /// <summary>Flush all pending entries. Awaits any in-flight eager flush first.</summary>
-    public async Task FlushAsync(CancellationToken cancellationToken = default)
+    /// <summary>Flush all pending entries, serialized after any in-flight
+    /// eager flush (which is awaited even when nothing new is pending).</summary>
+    public Task FlushAsync(CancellationToken cancellationToken = default)
     {
-        var t = Task.Run(() => DrainAsync(cancellationToken));
-        _flushTask = t;
-        await t.ConfigureAwait(false);
-        if (ReferenceEquals(_flushTask, t)) _flushTask = null;
+        var (items, prev, done) = DetachAndChain();
+        return Task.Run(() => RunDrainAsync(items, prev, done, cancellationToken), CancellationToken.None);
     }
 
     /// <summary>Final flush before teardown. Never raises.</summary>
@@ -130,42 +136,51 @@ public sealed class TranscriptMirrorBatcher : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // No disposable synchronization primitive: every in-flight drain
+        // completes its own chain link, so nothing is torn down under it.
         await CloseAsync().ConfigureAwait(false);
-        _flushLock.Dispose();
     }
 
-    private async Task DrainAsync(CancellationToken cancellationToken = default)
+    private (List<MirrorEntry> Items, Task Prev, TaskCompletionSource Done) DetachAndChain()
     {
-        List<MirrorEntry> items;
+        var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_gate)
         {
-            items = _pending;
+            var items = _pending;
             _pending = new List<MirrorEntry>();
             _pendingEntries = 0;
             _pendingBytes = 0;
+            var prev = _tail;
+            _tail = done.Task;
+            return (items, prev, done);
         }
-        if (items.Count == 0) return;
+    }
 
+    private async Task RunDrainAsync(
+        List<MirrorEntry> items, Task prev, TaskCompletionSource done, CancellationToken cancellationToken)
+    {
         var errors = new List<(SessionKey Key, string Message)>();
-        await _flushLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            // Wait for the previous drain (never faults: links complete via
+            // TrySetResult). Deliberately not cancellable: skipping ahead
+            // would reorder appends.
+            await prev.ConfigureAwait(false);
+            if (items.Count == 0) return;
             await DoFlushAsync(items, errors, cancellationToken).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            // Quiet on shutdown cancellation (commit 9d2c650).
-            return;
         }
         catch
         {
-            // DoFlushAsync already wraps store.AppendAsync; this guards any
-            // remaining unguarded path so the "never raises" contract holds.
+            // Quiet on shutdown cancellation (commit 9d2c650). DoFlushAsync
+            // already wraps store.AppendAsync; this guards any remaining
+            // unguarded path so the "never raises" contract holds.
             return;
         }
         finally
         {
-            _flushLock.Release();
+            // Release the next drain before reporting errors so a slow
+            // OnError callback cannot block subsequent appends (Python parity).
+            done.TrySetResult();
         }
 
         foreach (var (key, msg) in errors)

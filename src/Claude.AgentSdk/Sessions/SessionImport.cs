@@ -107,22 +107,16 @@ public static class SessionImport
             };
             await ImportSessionFileAsync(filePath, subKey, store, batchSize, cancellationToken).ConfigureAwait(false);
 
-            // Sidecar metadata file.
-            var metaPath = filePath[..^".jsonl".Length] + ".meta.json";
-            if (File.Exists(metaPath))
+            // Sidecar metadata file. A missing, corrupt, or non-object sidecar
+            // is treated as absent (the transcript is still imported); other
+            // read errors propagate. Mirrors Python _read_agent_metadata_sidecar.
+            var metaNode = await ReadAgentMetadataSidecarAsync(filePath, cancellationToken).ConfigureAwait(false);
+            if (metaNode is not null)
             {
-                try
-                {
-                    var metaText = await File.ReadAllTextAsync(metaPath, Encoding.UTF8, cancellationToken).ConfigureAwait(false);
-                    var metaNode = JsonNode.Parse(metaText) as JsonObject;
-                    if (metaNode is not null)
-                    {
-                        metaNode["type"] = "agent_metadata";
-                        var entry = SessionSummary.JsonObjectToEntry(metaNode);
-                        await store.AppendAsync(subKey, new[] { entry }, cancellationToken).ConfigureAwait(false);
-                    }
-                }
-                catch (FileNotFoundException) { /* fine */ }
+                // Synthetic discriminator last so a stray "type" key can never shadow it.
+                metaNode["type"] = "agent_metadata";
+                var entry = SessionSummary.JsonObjectToEntry(metaNode);
+                await store.AppendAsync(subKey, new[] { entry }, cancellationToken).ConfigureAwait(false);
             }
         }
     }
@@ -139,7 +133,9 @@ public static class SessionImport
 
         if (directory is not null)
         {
-            var projectKey = SessionPaths.SanitizePath(Path.GetFullPath(directory));
+            // realpath + NFC (Python _canonicalize_path) so symlinked dirs
+            // resolve to the same project dir the CLI wrote to.
+            var projectKey = SessionPaths.SanitizePath(SessionPaths.CanonicalizePath(directory));
             var candidate = Path.Combine(projectsDir, projectKey, fileName);
             if (File.Exists(candidate) && new FileInfo(candidate).Length > 0)
                 return candidate;
@@ -154,6 +150,26 @@ public static class SessionImport
                 return candidate;
         }
         return null;
+    }
+
+    internal static async Task<JsonObject?> ReadAgentMetadataSidecarAsync(string transcriptPath, CancellationToken cancellationToken)
+    {
+        var metaPath = transcriptPath[..^".jsonl".Length] + ".meta.json";
+        string metaText;
+        try
+        {
+            metaText = await File.ReadAllTextAsync(metaPath, new UTF8Encoding(false, throwOnInvalidBytes: true), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (FileNotFoundException) { return null; }
+        catch (DirectoryNotFoundException) { return null; }
+        catch (DecoderFallbackException) { return null; } // Python: UnicodeDecodeError is a ValueError
+        try
+        {
+            return JsonNode.Parse(metaText) as JsonObject;
+        }
+        catch (JsonException) { return null; }
+        catch (ArgumentException) { return null; } // e.g. duplicate keys
     }
 
     private static IEnumerable<string> CollectJsonlFiles(string baseDir)

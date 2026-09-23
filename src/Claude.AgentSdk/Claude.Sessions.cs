@@ -110,8 +110,11 @@ public static class ClaudeSessions
     }
 
     /// <summary>
-    /// List subagent identifiers (sub-keys) for a session in a
-    /// <see cref="ISessionStore"/>.
+    /// List subagent IDs for a session in a <see cref="ISessionStore"/>.
+    /// Mirrors Python <c>list_subagents_from_store</c>: only sub-keys under
+    /// <c>subagents/</c> whose last segment is <c>agent-&lt;id&gt;</c> are
+    /// reported, as the bare <c>&lt;id&gt;</c> (deduplicated, first-seen
+    /// order). Pass the result to <see cref="GetSubagentMessagesAsync"/>.
     /// </summary>
     public static async Task<IReadOnlyList<string>> ListSubagentsAsync(
         ISessionStore store,
@@ -124,31 +127,104 @@ public static class ClaudeSessions
         if (!SessionStoreValidation.StoreImplements(store, nameof(ISessionStore.ListSubkeysAsync)))
             return Array.Empty<string>();
         var projectKey = SessionPaths.ProjectKeyForDirectory(directory);
-        return await store.ListSubkeysAsync(new SessionListSubkeysKey(projectKey, sessionId), cancellationToken).ConfigureAwait(false);
+        var subkeys = await store.ListSubkeysAsync(new SessionListSubkeysKey(projectKey, sessionId), cancellationToken).ConfigureAwait(false);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var ids = new List<string>();
+        foreach (var subpath in subkeys)
+        {
+            if (subpath is null || !subpath.StartsWith("subagents/", StringComparison.Ordinal)) continue;
+            var last = subpath[(subpath.LastIndexOf('/') + 1)..];
+            if (!last.StartsWith("agent-", StringComparison.Ordinal)) continue;
+            var agentId = last["agent-".Length..];
+            if (seen.Add(agentId)) ids.Add(agentId);
+        }
+        return ids;
     }
 
     /// <summary>
-    /// Load messages for a single subagent transcript from a
-    /// <see cref="ISessionStore"/>.
+    /// Load messages for a single subagent from a <see cref="ISessionStore"/>.
+    /// Mirrors Python <c>get_subagent_messages_from_store</c>:
+    /// <paramref name="agentId"/> is an id returned by
+    /// <see cref="ListSubagentsAsync"/>; the transcript is located at
+    /// <c>subagents/agent-&lt;id&gt;</c> or, when the store can enumerate
+    /// sub-keys, any nested <c>subagents/**/agent-&lt;id&gt;</c>. Returns an
+    /// empty list when the subagent is not found.
+    /// <para>Back-compat: a value containing <c>/</c> is treated as a raw
+    /// store sub-key (the pre-parity contract); it must start with
+    /// <c>subagents/</c> and contain no empty, <c>.</c> or <c>..</c>
+    /// segments.</para>
     /// </summary>
+    /// <exception cref="ArgumentException">The id / sub-key is malformed.</exception>
     public static async Task<IReadOnlyList<SessionMessage>> GetSubagentMessagesAsync(
         ISessionStore store,
         string sessionId,
-        string subpath,
+        string agentId,
         string? directory = null,
         CancellationToken cancellationToken = default)
     {
         if (!SessionPaths.ValidateUuid(sessionId))
             throw new InvalidSessionIdException(sessionId);
+        if (string.IsNullOrEmpty(agentId)) return Array.Empty<SessionMessage>();
+        if (agentId.Contains('\0'))
+            throw new ArgumentException("agentId must not contain NUL", nameof(agentId));
+
         var projectKey = SessionPaths.ProjectKeyForDirectory(directory);
+        string subpath;
+        if (agentId.Contains('/') || agentId.Contains('\\'))
+        {
+            if (!IsValidSubagentSubkey(agentId))
+                throw new ArgumentException($"Invalid subagent sub-key: '{agentId}'", nameof(agentId));
+            subpath = agentId;
+        }
+        else
+        {
+            subpath = $"subagents/agent-{agentId}";
+            if (SessionStoreValidation.StoreImplements(store, nameof(ISessionStore.ListSubkeysAsync)))
+            {
+                var subkeys = await store.ListSubkeysAsync(new SessionListSubkeysKey(projectKey, sessionId), cancellationToken).ConfigureAwait(false);
+                var target = "agent-" + agentId;
+                var match = subkeys.FirstOrDefault(sk =>
+                    sk is not null
+                    && sk.StartsWith("subagents/", StringComparison.Ordinal)
+                    && sk[(sk.LastIndexOf('/') + 1)..] == target);
+                if (match is null) return Array.Empty<SessionMessage>();
+                subpath = match;
+            }
+        }
+
         var entries = await store.LoadAsync(new SessionKey
         {
             ProjectKey = projectKey,
             SessionId = sessionId,
             Subpath = subpath,
         }, cancellationToken).ConfigureAwait(false);
-        if (entries is null) throw new SessionNotFoundException(sessionId);
-        return EntriesToSessionMessages(entries, sessionId);
+        if (entries is null || entries.Count == 0) return Array.Empty<SessionMessage>();
+
+        // The synthetic agent_metadata entry (store copy of .meta.json) names
+        // the Agent tool_use that spawned this subagent; last one wins.
+        string? parentToolUseId = null;
+        foreach (var e in entries)
+        {
+            if (e.Type != "agent_metadata") continue;
+            var meta = SessionSummary.EntryToJsonObject(e);
+            parentToolUseId = meta.TryGetPropertyValue("toolUseId", out var t)
+                && t is System.Text.Json.Nodes.JsonValue tv && tv.TryGetValue<string>(out var ts) ? ts : null;
+        }
+
+        var messages = EntriesToSessionMessages(entries, sessionId);
+        if (parentToolUseId is null) return messages;
+        return messages.Select(m => m with { ParentToolUseId = parentToolUseId }).ToList();
+    }
+
+    private static bool IsValidSubagentSubkey(string subkey)
+    {
+        if (!subkey.StartsWith("subagents/", StringComparison.Ordinal)) return false;
+        foreach (var part in subkey.Split('/', '\\'))
+        {
+            if (part.Length == 0 || part == "." || part == "..") return false;
+            if (part.Length >= 2 && char.IsLetter(part[0]) && part[1] == ':') return false;
+        }
+        return true;
     }
 
     /// <summary>

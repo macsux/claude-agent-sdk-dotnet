@@ -9,7 +9,7 @@ using System.Text.Json.Nodes;
 
 namespace Claude.AgentSdk.Sessions;
 
-/// <summary>Result of <see cref="SessionResume.MaterializeResumeSessionAsync"/>.</summary>
+/// <summary>Result of <see cref="SessionResume.MaterializeResumeSessionAsync(ClaudeAgentOptions, CancellationToken)"/>.</summary>
 /// <remarks>
 /// <para><c>ConfigDir</c> is a temporary directory laid out like
 /// <c>~/.claude</c>. Point the subprocess at it via
@@ -31,8 +31,26 @@ public sealed record MaterializedResume(
 /// </summary>
 public static class SessionResume
 {
-    /// <summary>Default load timeout (mirrors Python's 30s default).</summary>
-    public static readonly TimeSpan DefaultLoadTimeout = TimeSpan.FromSeconds(30);
+    /// <summary>Default load timeout (mirrors Python's
+    /// <c>ClaudeAgentOptions.load_timeout_ms = 60_000</c>).</summary>
+    public static readonly TimeSpan DefaultLoadTimeout = TimeSpan.FromMilliseconds(60_000);
+
+    /// <summary>Default macOS Keychain service name for OAuth credentials when
+    /// <c>CLAUDE_CONFIG_DIR</c> is unset (Python <c>_KEYCHAIN_SERVICE_NAME</c>).</summary>
+    private const string KeychainServiceName = "Claude Code-credentials";
+
+    /// <summary>User-settings keys stripped for the redirected config dir
+    /// (Python <c>_RESUME_SETTINGS_STRIPPED_KEYS</c>).</summary>
+    private static readonly string[] ResumeSettingsStrippedKeys = { "enabledPlugins", "extraKnownMarketplaces" };
+
+    /// <summary>Test seam: replaces the macOS Keychain lookup. Returns the
+    /// credentials JSON or <c>null</c>.</summary>
+    internal static Func<string?> KeychainReader { get; set; } = ReadKeychainCredentials;
+
+    /// <summary>Test seam: overrides the user's home directory used to locate
+    /// <c>~/.claude</c> and <c>~/.claude.json</c>.</summary>
+    internal static Func<string> HomeDirectory { get; set; } =
+        () => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
     /// <summary>
     /// Construct the <see cref="TranscriptMirrorBatcher"/> for a session.
@@ -64,15 +82,28 @@ public static class SessionResume
     /// it to a temp dir. Returns <c>null</c> when no materialization is
     /// needed. Mirrors Python <c>materialize_resume_session</c>.
     /// </summary>
+    public static Task<MaterializedResume?> MaterializeResumeSessionAsync(
+        ClaudeAgentOptions options,
+        CancellationToken cancellationToken = default)
+        => MaterializeResumeSessionAsync(options, DefaultLoadTimeout, cancellationToken);
+
+    /// <summary>
+    /// Overload taking an explicit per-call store timeout (Python
+    /// <c>options.load_timeout_ms</c>) applied to each
+    /// <c>LoadAsync</c> / <c>ListSessionsAsync</c> / <c>ListSubkeysAsync</c>.
+    /// </summary>
     public static async Task<MaterializedResume?> MaterializeResumeSessionAsync(
         ClaudeAgentOptions options,
+        TimeSpan loadTimeout,
         CancellationToken cancellationToken = default)
     {
         var store = options.SessionStore;
         if (store is null) return null;
         if (options.Resume is null && !options.ContinueConversation) return null;
+        if (loadTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(loadTimeout), "loadTimeout must be positive");
 
-        var timeout = DefaultLoadTimeout;
+        var timeout = loadTimeout;
         var projectKey = SessionPaths.ProjectKeyForDirectory(options.Cwd);
 
         (string SessionId, IReadOnlyList<SessionStoreEntry> Entries)? resolved;
@@ -90,13 +121,18 @@ public static class SessionResume
         var sessionId = resolved.Value.SessionId;
         var entries = resolved.Value.Entries;
 
-        var tmpBase = Path.Combine(Path.GetTempPath(), "claude-resume-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(tmpBase);
+        // Python tempfile.mkdtemp: unique, created 0700 on Unix.
+        var tmpBase = Directory.CreateTempSubdirectory("claude-resume-").FullName;
         try
         {
             var projectDir = Path.Combine(tmpBase, "projects", projectKey);
-            Directory.CreateDirectory(projectDir);
+            FileSessionStore.CreatePrivateDirectory(projectDir);
             WriteJsonl(Path.Combine(projectDir, sessionId + ".jsonl"), entries);
+
+            // The subprocess will run with CLAUDE_CONFIG_DIR=tmpBase. Copy auth
+            // config from the caller's effective config locations so it can
+            // authenticate. Missing files are fine (API-key auth, etc.).
+            CopyAuthFiles(tmpBase, options.Env);
 
             // Materialize subagent transcripts if the store can enumerate them.
             if (SessionStoreValidation.StoreImplements(store, nameof(ISessionStore.ListSubkeysAsync)))
@@ -194,8 +230,8 @@ public static class SessionResume
                 last.Remove("type");
                 var metaPath = Path.Combine(Path.GetDirectoryName(subFile)!,
                     Path.GetFileNameWithoutExtension(subFile) + ".meta.json");
-                Directory.CreateDirectory(Path.GetDirectoryName(metaPath)!);
-                File.WriteAllText(metaPath, last.ToJsonString(), Encoding.UTF8);
+                FileSessionStore.CreatePrivateDirectory(Path.GetDirectoryName(metaPath)!);
+                WritePrivateFile(metaPath, Encoding.UTF8.GetBytes(last.ToJsonString()));
             }
         }
     }
@@ -232,12 +268,218 @@ public static class SessionResume
     private static void WriteJsonl(string path, IReadOnlyList<SessionStoreEntry> entries)
     {
         var dir = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
-        using var sw = new StreamWriter(path, append: false, Encoding.UTF8);
+        if (!string.IsNullOrEmpty(dir)) FileSessionStore.CreatePrivateDirectory(dir);
+        using var fs = FileSessionStore.OpenPrivateFile(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+        using var sw = new StreamWriter(fs, new UTF8Encoding(false));
         foreach (var e in entries)
         {
             sw.Write(SessionSummary.EntryToJsonObject(e).ToJsonString());
             sw.Write('\n');
+        }
+        sw.Flush();
+        EnsurePrivateMode(path);
+    }
+
+    /// <summary>Write <paramref name="content"/> to <paramref name="path"/>
+    /// with mode 0600 on Unix (Python writes then chmods 0o600).</summary>
+    private static void WritePrivateFile(string path, byte[] content)
+    {
+        using (var fs = FileSessionStore.OpenPrivateFile(path, FileMode.Create, FileAccess.Write, FileShare.None))
+        {
+            fs.Write(content, 0, content.Length);
+        }
+        EnsurePrivateMode(path);
+    }
+
+    /// <summary>UnixCreateMode only applies to newly created files; chmod
+    /// covers a pre-existing target (Python <c>path.chmod(0o600)</c>).</summary>
+    private static void EnsurePrivateMode(string path)
+    {
+        if (OperatingSystem.IsWindows()) return;
+        try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); }
+        catch { /* best-effort, like Python's suppress(OSError) */ }
+    }
+
+    // ---- Auth / user-config seeding (Python _copy_auth_files) -------------
+
+    /// <summary>
+    /// Seed <paramref name="tmpBase"/> with the caller's auth and user config:
+    /// <c>.credentials.json</c> (refreshToken redacted), <c>.claude.json</c>,
+    /// and user <c>settings.json</c> / <c>cowork_settings.json</c> (plugin
+    /// declarations stripped). Mirrors Python <c>_copy_auth_files</c>.
+    /// </summary>
+    internal static void CopyAuthFiles(string tmpBase, IReadOnlyDictionary<string, string>? optEnv)
+    {
+        string? Opt(string name)
+            => optEnv is not null && optEnv.TryGetValue(name, out var v) && !string.IsNullOrEmpty(v) ? v : null;
+        string? Env(string name)
+        {
+            var v = Environment.GetEnvironmentVariable(name);
+            return string.IsNullOrEmpty(v) ? null : v;
+        }
+
+        var callerConfigDir = Opt("CLAUDE_CONFIG_DIR") ?? Env("CLAUDE_CONFIG_DIR");
+        var home = HomeDirectory();
+        var sourceConfigDir = callerConfigDir ?? Path.Combine(home, ".claude");
+
+        var credsBytes = ReadIfPresent(Path.Combine(sourceConfigDir, ".credentials.json"));
+        string? credsJson = credsBytes is null ? null : Encoding.UTF8.GetString(credsBytes);
+
+        // macOS default setup keeps OAuth tokens in the Keychain. Redirecting
+        // CLAUDE_CONFIG_DIR changes the Keychain service-name suffix, so the
+        // subprocess falls back to ${tmpBase}/.credentials.json. Skipped when
+        // env-based auth or a custom config dir is already in play.
+        if (callerConfigDir is null
+            && (Opt("ANTHROPIC_API_KEY") ?? Env("ANTHROPIC_API_KEY")) is null
+            && (Opt("CLAUDE_CODE_OAUTH_TOKEN") ?? Env("CLAUDE_CODE_OAUTH_TOKEN")) is null)
+        {
+            string? keychain = null;
+            try { keychain = KeychainReader(); } catch { /* best-effort */ }
+            if (keychain is not null) credsJson = keychain;
+        }
+
+        WriteRedactedCredentials(credsJson, Path.Combine(tmpBase, ".credentials.json"));
+
+        var claudeJsonSrc = callerConfigDir is not null
+            ? Path.Combine(callerConfigDir, ".claude.json")
+            : Path.Combine(home, ".claude.json");
+        CopyIfPresent(claudeJsonSrc, Path.Combine(tmpBase, ".claude.json"));
+
+        foreach (var name in new[] { "settings.json", "cowork_settings.json" })
+            CopyIfPresent(Path.Combine(sourceConfigDir, name), Path.Combine(tmpBase, name), StripSettingsForResume);
+    }
+
+    /// <summary>Drop settings keys that misbehave under a redirected config
+    /// dir (Python <c>_strip_settings_for_resume</c>). Content that doesn't
+    /// parse as a JSON object is returned untouched.</summary>
+    internal static byte[] StripSettingsForResume(byte[] content)
+    {
+        JsonObject? parsed;
+        try
+        {
+            // utf-8-sig: tolerate a UTF-8 BOM (PowerShell writes one).
+            var span = content.AsSpan();
+            if (span.Length >= 3 && span[0] == 0xEF && span[1] == 0xBB && span[2] == 0xBF) span = span[3..];
+            var text = new UTF8Encoding(false, throwOnInvalidBytes: true).GetString(span);
+            parsed = JsonNode.Parse(text) as JsonObject;
+        }
+        catch
+        {
+            return content;
+        }
+        if (parsed is null) return content;
+
+        var stripped = false;
+        foreach (var key in ResumeSettingsStrippedKeys)
+            stripped |= parsed.Remove(key);
+        if (parsed["env"] is JsonObject envBlock && envBlock.Remove("CLAUDE_CONFIG_DIR"))
+            stripped = true;
+        if (!stripped) return content;
+        try
+        {
+            return Encoding.UTF8.GetBytes(parsed.ToJsonString());
+        }
+        catch
+        {
+            return content;
+        }
+    }
+
+    /// <summary>Write <paramref name="credsJson"/> with
+    /// <c>claudeAiOauth.refreshToken</c> removed so the resumed subprocess
+    /// can't consume the parent's single-use refresh token (Python
+    /// <c>_write_redacted_credentials</c>).</summary>
+    internal static void WriteRedactedCredentials(string? credsJson, string dst)
+    {
+        if (credsJson is null) return;
+        var output = credsJson;
+        try
+        {
+            if (JsonNode.Parse(credsJson) is JsonObject data
+                && data["claudeAiOauth"] is JsonObject oauth
+                && oauth.Remove("refreshToken"))
+            {
+                output = data.ToJsonString();
+            }
+        }
+        catch
+        {
+            // Unparseable — write through; subprocess will fail to parse it too.
+        }
+        WritePrivateFile(dst, new UTF8Encoding(false).GetBytes(output));
+    }
+
+    /// <summary>Read a regular file, or return <c>null</c> when missing or
+    /// unreadable (best-effort; never aborts the resume).</summary>
+    private static byte[]? ReadIfPresent(string src)
+    {
+        try
+        {
+            var info = new FileInfo(src);
+            if (!info.Exists) return null; // missing, or a directory
+            return File.ReadAllBytes(src);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void CopyIfPresent(string src, string dst, Func<byte[], byte[]>? transform = null)
+    {
+        var content = ReadIfPresent(src);
+        if (content is null) return;
+        try
+        {
+            WritePrivateFile(dst, transform is null ? content : transform(content));
+        }
+        catch
+        {
+            // Don't leave a truncated dst behind for the subprocess to misparse.
+            try { File.Delete(dst); } catch { /* ignore */ }
+        }
+    }
+
+    /// <summary>Read OAuth credentials JSON from the macOS Keychain (default
+    /// service name). Best-effort — <c>null</c> on any error or non-macOS.</summary>
+    private static string? ReadKeychainCredentials()
+    {
+        if (!OperatingSystem.IsMacOS()) return null;
+        string user;
+        try
+        {
+            user = Environment.GetEnvironmentVariable("USER") is { Length: > 0 } u ? u : Environment.UserName;
+        }
+        catch
+        {
+            user = "claude-code-user";
+        }
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("security")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            foreach (var a in new[] { "find-generic-password", "-a", user, "-w", "-s", KeychainServiceName })
+                psi.ArgumentList.Add(a);
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc is null) return null;
+            var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+            _ = proc.StandardError.ReadToEndAsync();
+            if (!proc.WaitForExit(5000))
+            {
+                try { proc.Kill(entireProcessTree: true); } catch { /* ignore */ }
+                return null;
+            }
+            if (proc.ExitCode != 0) return null;
+            var output = stdoutTask.GetAwaiter().GetResult().Trim();
+            return output.Length == 0 ? null : output;
+        }
+        catch
+        {
+            return null;
         }
     }
 
