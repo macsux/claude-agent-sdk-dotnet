@@ -24,7 +24,7 @@ A modern .NET library for interacting with the Claude Code CLI, providing both a
 
 ## Prerequisites
 
-- .NET 8.0 or .NET 9.0
+- .NET 10.0
 - Claude Code CLI >= 2.0.0:
   ```bash
   npm install -g @anthropic-ai/claude-code
