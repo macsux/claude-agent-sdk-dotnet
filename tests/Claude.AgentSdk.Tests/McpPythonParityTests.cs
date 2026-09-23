@@ -257,18 +257,19 @@ public sealed class McpPythonParityTests
     public async Task CancelledNotification_CancelsTheInFlightCall()
     {
         var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var outcome = "";
+        // The bridge answers as soon as the token fires, which can be before the handler's catch runs.
+        var outcome = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         await using var bridge = BridgeFor(s => s.Tool("slow", async (CancellationToken ct) =>
         {
             started.SetResult();
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(30), ct);
-                outcome = "finished";
+                outcome.TrySetResult("finished");
             }
             catch (OperationCanceledException)
             {
-                outcome = "cancelled";
+                outcome.TrySetResult("cancelled");
                 throw;
             }
             return "done";
@@ -279,7 +280,7 @@ public sealed class McpPythonParityTests
         await bridge.SendMessageAsync(Notification("notifications/cancelled", new { requestId = 77, reason = "user interrupted" }));
         var response = await call.WaitAsync(TimeSpan.FromSeconds(5));
 
-        Assert.Equal("cancelled", outcome);
+        Assert.Equal("cancelled", await outcome.Task.WaitAsync(TimeSpan.FromSeconds(5)));
         Assert.Equal(77, response.GetProperty("id").GetInt32());
         Assert.Contains("cancelled", response.GetProperty("error").GetProperty("message").GetString()!, StringComparison.OrdinalIgnoreCase);
 
