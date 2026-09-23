@@ -19,6 +19,11 @@ public static class SessionImport
     /// <paramref name="batchSize"/> entries (or 1 MiB of line text,
     /// whichever comes first). Skips blank lines.
     /// </summary>
+    /// <exception cref="JsonException">
+    /// A line is not valid JSON, or is not a JSON object (Python <c>json.loads</c> raises on a
+    /// malformed line; a non-object line cannot be represented as a <see cref="SessionStoreEntry"/>).
+    /// Batches before the bad line have already been appended.
+    /// </exception>
     public static async Task ImportSessionFileAsync(
         string sessionFilePath,
         SessionKey key,
@@ -35,10 +40,18 @@ public static class SessionImport
         while ((line = await sr.ReadLineAsync(cancellationToken).ConfigureAwait(false)) != null)
         {
             if (string.IsNullOrEmpty(line)) continue;
+            // Malformed lines raise rather than being silently dropped (Python json.loads).
             JsonNode? node;
-            try { node = JsonNode.Parse(line); }
-            catch (JsonException) { continue; }
-            if (node is not JsonObject obj) continue;
+            try
+            {
+                node = JsonNode.Parse(line);
+            }
+            catch (JsonException e)
+            {
+                throw new JsonException($"Invalid JSON in {sessionFilePath}: {e.Message}", e);
+            }
+            if (node is not JsonObject obj)
+                throw new JsonException($"Invalid transcript line in {sessionFilePath}: expected a JSON object");
             batch.Add(SessionSummary.JsonObjectToEntry(obj));
             nbytes += line.Length;
             if (batch.Count >= batchSize || nbytes >= TranscriptMirrorBatcher.DefaultMaxPendingBytes)
@@ -93,7 +106,6 @@ public static class SessionImport
 
         var sessionDir = Path.Combine(Path.GetDirectoryName(resolved)!, sessionId);
         var subagentsDir = Path.Combine(sessionDir, "subagents");
-        if (!Directory.Exists(subagentsDir)) return;
 
         foreach (var filePath in CollectJsonlFiles(subagentsDir))
         {
@@ -122,35 +134,14 @@ public static class SessionImport
     }
 
     /// <summary>
-    /// Search the projects directory tree for the JSONL for
-    /// <paramref name="sessionId"/>. If <paramref name="directory"/> is
-    /// given, only that project directory is checked.
+    /// Search the projects directory tree for the non-empty JSONL for
+    /// <paramref name="sessionId"/> (Python <c>_resolve_session_file_path</c>). If
+    /// <paramref name="directory"/> is given, its project directory (with the long-path
+    /// hash-mismatch prefix fallback) and then its worktrees are checked; otherwise
+    /// every project directory.
     /// </summary>
     public static string? ResolveSessionFilePath(string sessionId, string? directory)
-    {
-        var projectsDir = SessionPaths.GetProjectsDir();
-        var fileName = sessionId + ".jsonl";
-
-        if (directory is not null)
-        {
-            // realpath + NFC (Python _canonicalize_path) so symlinked dirs
-            // resolve to the same project dir the CLI wrote to.
-            var projectKey = SessionPaths.SanitizePath(SessionPaths.CanonicalizePath(directory));
-            var candidate = Path.Combine(projectsDir, projectKey, fileName);
-            if (File.Exists(candidate) && new FileInfo(candidate).Length > 0)
-                return candidate;
-            return null;
-        }
-
-        if (!Directory.Exists(projectsDir)) return null;
-        foreach (var pdir in Directory.EnumerateDirectories(projectsDir))
-        {
-            var candidate = Path.Combine(pdir, fileName);
-            if (File.Exists(candidate) && new FileInfo(candidate).Length > 0)
-                return candidate;
-        }
-        return null;
-    }
+        => SessionTranscripts.FindSessionFile(sessionId, directory)?.FilePath;
 
     internal static async Task<JsonObject?> ReadAgentMetadataSidecarAsync(string transcriptPath, CancellationToken cancellationToken)
     {
@@ -172,28 +163,32 @@ public static class SessionImport
         catch (ArgumentException) { return null; } // e.g. duplicate keys
     }
 
+    /// <summary>
+    /// Recursively yield <c>*.jsonl</c> files under <paramref name="baseDir"/>, entries sorted by
+    /// name per directory with subdirectories visited in place (Python <c>_collect_jsonl_files</c>).
+    /// </summary>
     private static IEnumerable<string> CollectJsonlFiles(string baseDir)
     {
-        if (!Directory.Exists(baseDir)) yield break;
-        // Sort per directory for deterministic order across platforms.
-        var stack = new Stack<string>();
-        stack.Push(baseDir);
-        while (stack.Count > 0)
+        string[] dirents;
+        try
         {
-            var current = stack.Pop();
-            IEnumerable<string> subdirs;
-            IEnumerable<string> files;
-            try
+            dirents = Directory.GetFileSystemEntries(baseDir);
+        }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException)
+        {
+            yield break;
+        }
+        Array.Sort(dirents, (x, y) => string.CompareOrdinal(Path.GetFileName(x), Path.GetFileName(y)));
+        foreach (var entry in dirents)
+        {
+            if (Directory.Exists(entry))
             {
-                subdirs = Directory.EnumerateDirectories(current).OrderBy(p => Path.GetFileName(p), StringComparer.Ordinal);
-                files = Directory.EnumerateFiles(current, "*.jsonl").OrderBy(p => Path.GetFileName(p), StringComparer.Ordinal);
+                foreach (var f in CollectJsonlFiles(entry)) yield return f;
             }
-            catch
+            else if (File.Exists(entry) && entry.EndsWith(".jsonl", StringComparison.Ordinal))
             {
-                continue;
+                yield return entry;
             }
-            foreach (var d in subdirs.Reverse()) stack.Push(d);
-            foreach (var f in files) yield return f;
         }
     }
 }

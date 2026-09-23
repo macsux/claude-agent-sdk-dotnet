@@ -12,15 +12,13 @@ using System.Text.RegularExpressions;
 
 namespace Claude.AgentSdk.Sessions;
 
-/// <summary>Result of a <see cref="SessionMutations.ForkSessionViaStoreAsync"/>.</summary>
+/// <summary>Result of <see cref="SessionMutations.ForkSession"/> / <see cref="SessionMutations.ForkSessionViaStoreAsync"/>.</summary>
 public sealed record ForkSessionResult(string SessionId);
 
 /// <summary>
-/// SessionStore-backed mutation helpers (async variants from Python's
-/// <c>session_mutations.py</c>). The disk-based <c>rename_session</c> /
-/// <c>tag_session</c> / <c>delete_session</c> / <c>fork_session</c>
-/// functions operate on local <c>~/.claude</c>; the store-backed
-/// variants exposed here are the ones routinely used by SDK consumers.
+/// Session mutations from Python's <c>session_mutations.py</c>: the disk-based
+/// <c>rename_session</c> / <c>tag_session</c> / <c>delete_session</c> / <c>fork_session</c>
+/// (over local <c>~/.claude/projects</c>) and their SessionStore-backed async variants.
 /// </summary>
 public static class SessionMutations
 {
@@ -188,8 +186,8 @@ public static class SessionMutations
     {
         if (!SessionPaths.ValidateUuid(sessionId))
             throw new InvalidSessionIdException(sessionId);
-        if (upToMessageId is not null && !SessionPaths.ValidateUuid(upToMessageId))
-            throw new InvalidSessionIdException(upToMessageId);
+        if (!string.IsNullOrEmpty(upToMessageId) && !SessionPaths.ValidateUuid(upToMessageId))
+            throw new InvalidSessionIdException(upToMessageId, $"Invalid up_to_message_id: {upToMessageId}");
 
         var srcKey = new SessionKey
         {
@@ -240,6 +238,227 @@ public static class SessionMutations
         return new ForkSessionResult(forkedSessionId);
     }
 
+    // ---- Disk-backed (Python rename_session / tag_session / delete_session / fork_session) ----
+
+    /// <summary>
+    /// Rename a session by appending a <c>custom-title</c> entry to its JSONL. Repeated calls
+    /// are safe — the most recent wins. Mirrors Python <c>rename_session</c>.
+    /// </summary>
+    /// <exception cref="InvalidSessionIdException">The id is not a UUID.</exception>
+    /// <exception cref="ArgumentException">The title is empty after trimming.</exception>
+    /// <exception cref="SessionNotFoundException">The session file cannot be found.</exception>
+    public static void RenameSession(string sessionId, string title, string? directory = null)
+    {
+        if (!SessionPaths.ValidateUuid(sessionId))
+            throw new InvalidSessionIdException(sessionId);
+        var stripped = title?.Trim() ?? string.Empty;
+        if (stripped.Length == 0)
+            throw new ArgumentException("title must be non-empty", nameof(title));
+
+        var line = SessionTranscripts.ToPythonJson(new JsonObject
+        {
+            ["type"] = "custom-title",
+            ["customTitle"] = stripped,
+            ["sessionId"] = sessionId,
+        }) + "\n";
+        AppendToSession(sessionId, line, directory);
+    }
+
+    /// <summary>
+    /// Tag a session by appending a <c>tag</c> entry; <c>null</c> clears the tag (an empty-string
+    /// tag entry). Tags are Unicode-sanitized. Mirrors Python <c>tag_session</c>.
+    /// </summary>
+    /// <exception cref="InvalidSessionIdException">The id is not a UUID.</exception>
+    /// <exception cref="ArgumentException">The tag is empty after sanitization.</exception>
+    /// <exception cref="SessionNotFoundException">The session file cannot be found.</exception>
+    public static void TagSession(string sessionId, string? tag, string? directory = null)
+    {
+        if (!SessionPaths.ValidateUuid(sessionId))
+            throw new InvalidSessionIdException(sessionId);
+        if (tag is not null)
+        {
+            var sanitized = SanitizeUnicode(tag).Trim();
+            if (sanitized.Length == 0)
+                throw new ArgumentException("tag must be non-empty (use null to clear)", nameof(tag));
+            tag = sanitized;
+        }
+
+        var line = SessionTranscripts.ToPythonJson(new JsonObject
+        {
+            ["type"] = "tag",
+            ["tag"] = tag ?? string.Empty,
+            ["sessionId"] = sessionId,
+        }) + "\n";
+        AppendToSession(sessionId, line, directory);
+    }
+
+    /// <summary>
+    /// Hard-delete a session: removes <c>{sessionId}.jsonl</c> and the sibling
+    /// <c>{sessionId}/</c> subagent directory (if any). Mirrors Python <c>delete_session</c>.
+    /// </summary>
+    /// <exception cref="InvalidSessionIdException">The id is not a UUID.</exception>
+    /// <exception cref="SessionNotFoundException">The session file cannot be found.</exception>
+    public static void DeleteSession(string sessionId, string? directory = null)
+    {
+        if (!SessionPaths.ValidateUuid(sessionId))
+            throw new InvalidSessionIdException(sessionId);
+
+        if (SessionTranscripts.FindSessionFile(sessionId, directory) is not { } found)
+            throw NotFound(sessionId, directory);
+        try
+        {
+            File.Delete(found.FilePath);
+        }
+        catch (DirectoryNotFoundException e)
+        {
+            throw new SessionNotFoundException(sessionId, $"Session {sessionId} not found", e);
+        }
+        // Subagent transcripts live in a sibling {sessionId}/ dir; often absent.
+        try
+        {
+            var subDir = Path.Combine(Path.GetDirectoryName(found.FilePath)!, sessionId);
+            if (Directory.Exists(subDir)) Directory.Delete(subDir, recursive: true);
+        }
+        catch
+        {
+            // Python: shutil.rmtree(..., ignore_errors=True)
+        }
+    }
+
+    /// <summary>
+    /// Fork a session into a new session file (next to the source) with fresh UUIDs,
+    /// optionally up to and including <paramref name="upToMessageId"/>. Mirrors Python
+    /// <c>fork_session</c>.
+    /// </summary>
+    /// <exception cref="InvalidSessionIdException">An id is not a UUID.</exception>
+    /// <exception cref="SessionNotFoundException">The source session file cannot be found.</exception>
+    /// <exception cref="InvalidOperationException">Nothing to fork, or <paramref name="upToMessageId"/> not in the transcript.</exception>
+    public static ForkSessionResult ForkSession(
+        string sessionId,
+        string? directory = null,
+        string? upToMessageId = null,
+        string? title = null)
+    {
+        if (!SessionPaths.ValidateUuid(sessionId))
+            throw new InvalidSessionIdException(sessionId);
+        if (!string.IsNullOrEmpty(upToMessageId) && !SessionPaths.ValidateUuid(upToMessageId))
+            throw new InvalidSessionIdException(upToMessageId, $"Invalid up_to_message_id: {upToMessageId}");
+
+        if (SessionTranscripts.FindSessionFile(sessionId, directory) is not { } found)
+            throw NotFound(sessionId, directory);
+
+        var content = File.ReadAllBytes(found.FilePath);
+        if (content.Length == 0)
+            throw new InvalidOperationException($"Session {sessionId} has no messages to fork");
+
+        var utf8 = new UTF8Encoding(false, throwOnInvalidBytes: false);
+        var (transcript, contentReplacements) = ParseForkTranscript(utf8.GetString(content), sessionId);
+
+        string? DeriveTitle()
+        {
+            var bufLen = content.Length;
+            var buf = SessionTranscripts.LiteReadBufSize;
+            var head = utf8.GetString(content, 0, Math.Min(bufLen, buf));
+            var tailStart = Math.Max(0, bufLen - buf);
+            var tail = utf8.GetString(content, tailStart, bufLen - tailStart);
+            return NullIfEmpty(SessionTranscripts.ExtractLastJsonStringField(tail, "customTitle"))
+                   ?? NullIfEmpty(SessionTranscripts.ExtractLastJsonStringField(head, "customTitle"))
+                   ?? NullIfEmpty(SessionTranscripts.ExtractLastJsonStringField(tail, "aiTitle"))
+                   ?? NullIfEmpty(SessionTranscripts.ExtractLastJsonStringField(head, "aiTitle"))
+                   ?? NullIfEmpty(SessionTranscripts.ExtractFirstPromptFromHead(head));
+        }
+
+        var (forkedSessionId, lines) = BuildForkLines(
+            transcript, contentReplacements, sessionId, upToMessageId, title, DeriveTitle);
+
+        var forkPath = Path.Combine(found.ProjectDir, forkedSessionId + ".jsonl");
+        using (var fs = FileSessionStore.OpenPrivateFile(forkPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            var bytes = utf8.GetBytes(string.Join("\n", lines) + "\n");
+            fs.Write(bytes, 0, bytes.Length);
+        }
+        return new ForkSessionResult(forkedSessionId);
+    }
+
+    private static SessionNotFoundException NotFound(string sessionId, string? directory)
+        => new(sessionId, $"Session {sessionId} not found"
+                          + (string.IsNullOrEmpty(directory) ? "" : $" in project directory for {directory}"));
+
+    /// <summary>Transcript entries + content-replacement records from JSONL (Python <c>_parse_fork_transcript</c>).</summary>
+    private static (List<JsonObject> Transcript, List<JsonNode?> ContentReplacements) ParseForkTranscript(string content, string sessionId)
+    {
+        var transcript = new List<JsonObject>();
+        var contentReplacements = new List<JsonNode?>();
+        foreach (var raw in content.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0) continue;
+            if (SessionTranscripts.TryParseObject(line) is not { } entry) continue;
+            var type = StringOf(entry, "type");
+            if (TranscriptTypes.Contains(type ?? "") && StringOf(entry, "uuid") is not null)
+            {
+                transcript.Add(entry);
+            }
+            else if (type == "content-replacement"
+                     && StringOf(entry, "sessionId") == sessionId
+                     && entry["replacements"] is JsonArray repl)
+            {
+                foreach (var r in repl) contentReplacements.Add(r?.DeepClone());
+            }
+        }
+        return (transcript, contentReplacements);
+    }
+
+    /// <summary>
+    /// Append to an existing, non-empty session file found in the candidate project dirs
+    /// (Python <c>_append_to_session</c>); never creates the file.
+    /// </summary>
+    private static void AppendToSession(string sessionId, string data, string? directory)
+    {
+        var fileName = sessionId + ".jsonl";
+        if (string.IsNullOrEmpty(directory) && !Directory.Exists(SessionPaths.GetProjectsDir()))
+            throw new SessionNotFoundException(sessionId, $"Session {sessionId} not found (no projects directory)");
+
+        foreach (var (projectDir, _) in SessionTranscripts.CandidateProjectDirs(directory))
+        {
+            if (TryAppend(Path.Combine(projectDir, fileName), data)) return;
+        }
+
+        throw new SessionNotFoundException(sessionId, string.IsNullOrEmpty(directory)
+            ? $"Session {sessionId} not found in any project directory"
+            : $"Session {sessionId} not found in project directory for {directory}");
+    }
+
+    /// <summary>
+    /// Append <paramref name="data"/> if <paramref name="path"/> exists and is non-empty.
+    /// False when missing or 0-byte (a "keep searching" signal, as in Python <c>_try_append</c>);
+    /// other I/O errors propagate.
+    /// </summary>
+    private static bool TryAppend(string path, string data)
+    {
+        FileStream fs;
+        try
+        {
+            // FileMode.Open: fail rather than create (Python opens without O_CREAT).
+            fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+        }
+        catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return false;
+        }
+        using (fs)
+        {
+            if (fs.Length == 0) return false;
+            fs.Seek(0, SeekOrigin.End);
+            var bytes = Encoding.UTF8.GetBytes(data);
+            fs.Write(bytes, 0, bytes.Length);
+            return true;
+        }
+    }
+
+    private static string? NullIfEmpty(string? s) => string.IsNullOrEmpty(s) ? null : s;
+
+
     // ---- Fork transform --------------------------------------------------
 
     private static (string ForkedSessionId, List<string> Lines) BuildForkLines(
@@ -255,7 +474,7 @@ public static class SessionMutations
         if (transcript.Count == 0)
             throw new InvalidOperationException($"Session {sessionId} has no messages to fork");
 
-        if (upToMessageId is not null)
+        if (!string.IsNullOrEmpty(upToMessageId))
         {
             int cutoff = -1;
             for (int i = 0; i < transcript.Count; i++)
@@ -334,7 +553,7 @@ public static class SessionMutations
             foreach (var leak in new[] { "teamName", "agentName", "slug", "sourceToolAssistantUUID" })
                 forked.Remove(leak);
 
-            lines.Add(forked.ToJsonString());
+            lines.Add(SessionTranscripts.ToPythonJson(forked));
         }
 
         if (contentReplacements.Count > 0)
@@ -349,7 +568,7 @@ public static class SessionMutations
                 ["uuid"] = Guid.NewGuid().ToString(),
                 ["timestamp"] = now,
             };
-            lines.Add(crObj.ToJsonString());
+            lines.Add(SessionTranscripts.ToPythonJson(crObj));
         }
 
         var forkTitle = string.IsNullOrWhiteSpace(title) ? null : title!.Trim();
@@ -364,7 +583,7 @@ public static class SessionMutations
             ["uuid"] = Guid.NewGuid().ToString(),
             ["timestamp"] = now,
         };
-        lines.Add(titleObj.ToJsonString());
+        lines.Add(SessionTranscripts.ToPythonJson(titleObj));
 
         return (forkedSessionId, lines);
     }
@@ -381,7 +600,13 @@ public static class SessionMutations
             var at = StringOf(obj, "aiTitle");
             if (!string.IsNullOrEmpty(at)) ai = at;
         }
-        return custom ?? ai;
+        if (custom is not null) return custom;
+        if (ai is not null) return ai;
+        // First-prompt fallback over a re-serialized JSONL so skip patterns and truncation
+        // match the disk path (Python _derive_title_from_entries).
+        var jsonl = SessionTranscripts.EntriesToJsonl(raw);
+        var prompt = SessionTranscripts.ExtractFirstPromptFromHead(jsonl);
+        return string.IsNullOrEmpty(prompt) ? null : prompt;
     }
 
     private static SessionStoreEntry MakeExtraEntry(string type, Dictionary<string, JsonNode?> fields)

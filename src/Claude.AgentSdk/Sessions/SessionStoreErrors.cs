@@ -18,6 +18,13 @@ public sealed class InvalidSessionIdException : ClaudeSDKException
     {
         SessionId = sessionId;
     }
+
+    /// <summary>Create with a custom message (e.g. for an invalid <c>up_to_message_id</c>).</summary>
+    public InvalidSessionIdException(string sessionId, string message)
+        : base(message)
+    {
+        SessionId = sessionId;
+    }
 }
 
 /// <summary>
@@ -36,6 +43,12 @@ public sealed class SessionNotFoundException : ClaudeSDKException
 
     public SessionNotFoundException(string sessionId, string message)
         : base(message)
+    {
+        SessionId = sessionId;
+    }
+
+    public SessionNotFoundException(string sessionId, string message, Exception innerException)
+        : base(message, innerException)
     {
         SessionId = sessionId;
     }
