@@ -145,7 +145,18 @@ public sealed class ControlProtocolParityTests
                 decision_reason = "outside cwd",
                 title = "Claude wants to read /etc/passwd",
                 display_name = "Read file",
-                description = "desc"
+                description = "desc",
+                permission_suggestions = new object[]
+                {
+                    new
+                    {
+                        type = "addRules",
+                        rules = new[] { new { toolName = "Read", ruleContent = "/etc/**" } },
+                        behavior = "allow",
+                        destination = "session"
+                    },
+                    new { type = "someFutureUpdate" }
+                }
             }
         });
         await transport.WaitForAsync(t => t.ResponsesFor("cli_2").Count > 0);
@@ -158,6 +169,19 @@ public sealed class ControlProtocolParityTests
         Assert.Equal("Claude wants to read /etc/passwd", seen.Title);
         Assert.Equal("Read file", seen.DisplayName);
         Assert.Equal("desc", seen.Description);
+
+        // Wire-format suggestions parse (camelCase enums, toolName/ruleContent);
+        // unknown update types are skipped instead of failing the request.
+        var suggestion = Assert.Single(seen.Suggestions!);
+        Assert.Equal(PermissionUpdateType.AddRules, suggestion.Type);
+        Assert.Equal(PermissionBehavior.Allow, suggestion.Behavior);
+        Assert.Equal(PermissionUpdateDestination.Session, suggestion.Destination);
+        Assert.Equal("Read", suggestion.Rules![0].ToolName);
+        Assert.Equal("/etc/**", suggestion.Rules[0].RuleContent);
+
+        var response = transport.ResponsesFor("cli_2").Single().GetProperty("response");
+        Assert.Equal("success", response.GetProperty("subtype").GetString());
+        Assert.Equal("deny", response.GetProperty("response").GetProperty("behavior").GetString());
     }
 
     [Fact]

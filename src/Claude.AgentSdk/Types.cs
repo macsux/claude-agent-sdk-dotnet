@@ -492,6 +492,80 @@ public record PermissionUpdate(
 )
 {
     /// <summary>
+    /// Parse the control-protocol wire format (inverse of <see cref="ToDictionary"/>;
+    /// Python: <c>PermissionUpdate.from_dict</c>). Returns null for an update type
+    /// this SDK version doesn't know, so one unfamiliar suggestion from a newer CLI
+    /// can't fail the whole permission request. Unknown enum values in optional
+    /// fields are dropped.
+    /// </summary>
+    public static PermissionUpdate? FromControlProtocol(JsonElement data)
+    {
+        static string? Str(JsonElement e, string name) =>
+            e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        PermissionUpdateType? type = Str(data, "type") switch
+        {
+            "addRules" => PermissionUpdateType.AddRules,
+            "replaceRules" => PermissionUpdateType.ReplaceRules,
+            "removeRules" => PermissionUpdateType.RemoveRules,
+            "setMode" => PermissionUpdateType.SetMode,
+            "addDirectories" => PermissionUpdateType.AddDirectories,
+            "removeDirectories" => PermissionUpdateType.RemoveDirectories,
+            _ => null
+        };
+        if (type == null)
+            return null;
+
+        List<PermissionRuleValue>? rules = null;
+        if (data.TryGetProperty("rules", out var r) && r.ValueKind == JsonValueKind.Array)
+        {
+            rules = r.EnumerateArray()
+                .Where(x => x.ValueKind == JsonValueKind.Object && Str(x, "toolName") != null)
+                .Select(x => new PermissionRuleValue(Str(x, "toolName")!, Str(x, "ruleContent")))
+                .ToList();
+        }
+
+        List<string>? directories = null;
+        if (data.TryGetProperty("directories", out var d) && d.ValueKind == JsonValueKind.Array)
+        {
+            directories = d.EnumerateArray()
+                .Where(x => x.ValueKind == JsonValueKind.String)
+                .Select(x => x.GetString()!)
+                .ToList();
+        }
+
+        return new PermissionUpdate(
+            type.Value,
+            rules,
+            Str(data, "behavior") switch
+            {
+                "allow" => PermissionBehavior.Allow,
+                "deny" => PermissionBehavior.Deny,
+                "ask" => PermissionBehavior.Ask,
+                _ => null
+            },
+            Str(data, "mode") switch
+            {
+                "default" => PermissionMode.Default,
+                "acceptEdits" => PermissionMode.AcceptEdits,
+                "plan" => PermissionMode.Plan,
+                "bypassPermissions" => PermissionMode.BypassPermissions,
+                "dontAsk" => PermissionMode.DontAsk,
+                "auto" => PermissionMode.Auto,
+                _ => null
+            },
+            directories,
+            Str(data, "destination") switch
+            {
+                "userSettings" => PermissionUpdateDestination.UserSettings,
+                "projectSettings" => PermissionUpdateDestination.ProjectSettings,
+                "localSettings" => PermissionUpdateDestination.LocalSettings,
+                "session" => PermissionUpdateDestination.Session,
+                _ => null
+            });
+    }
+
+    /// <summary>
     /// Convert to dictionary format matching TypeScript control protocol.
     /// </summary>
     public Dictionary<string, object?> ToDictionary()

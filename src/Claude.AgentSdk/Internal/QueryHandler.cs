@@ -617,9 +617,13 @@ internal class QueryHandler : IAsyncDisposable
 
         var toolName = request.GetProperty("tool_name").GetString()!;
         var input = request.GetProperty("input");
-        var suggestions = request.TryGetProperty("permission_suggestions", out var s)
-            ? JsonSerializer.Deserialize<List<PermissionUpdate>>(s.GetRawText())
-            : null;
+        var suggestions = request.TryGetProperty("permission_suggestions", out var s) &&
+                          s.ValueKind == JsonValueKind.Array
+            ? s.EnumerateArray()
+                .Select(PermissionUpdate.FromControlProtocol)
+                .OfType<PermissionUpdate>()
+                .ToList()
+            : new List<PermissionUpdate>();
 
         string? Opt(string name) =>
             request.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
