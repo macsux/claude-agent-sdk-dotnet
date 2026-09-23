@@ -54,11 +54,7 @@ public class SkillsAndSandboxTests(ITestOutputHelper output) : IntegrationTestBa
             Settings = """{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"allowUnsandboxedCommands":false}}""",
         });
 
-    [IntegrationFact(Skip = "SDK bug: ClaudeAgentOptions.Sandbox is serialized into --settings with default JsonSerializer " +
-                            "options, so every unset SandboxSettings property is sent as null (\"excludedCommands\":null, " +
-                            "\"network\":null, ...). CLI 2.1.280 then silently ignores the sandbox block: Bash is not " +
-                            "auto-allowed and even `echo x > <cwd>/file` is denied. The identical settings without the nulls work " +
-                            "(see Sandbox_ViaSettingsJson_...).")]
+    [IntegrationFact]
     public Task Sandbox_ViaSandboxOption_AutoAllowsBashInCwd_AndBlocksWritesOutsideIt() =>
         RunSandboxScenario(o => o with
         {

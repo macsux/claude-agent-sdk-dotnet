@@ -123,10 +123,7 @@ public class McpTests(ITestOutputHelper output) : IntegrationTestBase(output)
         Assert.Equal(["add", "explode"], tools.Order().ToList());
     }
 
-    [IntegrationFact(Skip = "SDK bug: ListMcpServersAsync throws JsonException \"The JSON value could not be converted to " +
-                            "Claude.AgentSdk.McpServerConnectionStatus. Path: $.mcpServers[0].status\" for the CLI's " +
-                            "\"status\":\"connected\" — the enum has no JsonStringEnumConverter / member names " +
-                            "(and \"needs-auth\" needs an explicit name).")]
+    [IntegrationFact]
     public async Task ListMcpServers_ReturnsTypedStatus()
     {
         var (client, _) = await ConnectAndWaitForMcpAsync(nameof(ListMcpServers_ReturnsTypedStatus));

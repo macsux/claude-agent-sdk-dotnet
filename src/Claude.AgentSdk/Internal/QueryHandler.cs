@@ -688,13 +688,33 @@ internal class QueryHandler : IAsyncDisposable
         if (output.Reason != null)
             result["reason"] = output.Reason;
         if (output.HookSpecificOutput.HasValue)
-            result["hookSpecificOutput"] = output.HookSpecificOutput.Value.Clone();
+            result["hookSpecificOutput"] = WithoutNullMembers(output.HookSpecificOutput.Value);
         if (output.Async.HasValue)
             result["async"] = output.Async.Value;
         if (output.AsyncTimeout.HasValue)
             result["asyncTimeout"] = output.AsyncTimeout.Value;
 
         return result;
+    }
+
+    /// <summary>
+    /// Drop <c>null</c>-valued top-level members of a hook-specific output.
+    /// Python sends TypedDicts that only contain the keys that were set; the
+    /// CLI treats an explicit null (e.g. <c>"updatedInput": null</c>) as
+    /// invalid and ignores the whole decision, so a permission deny would not
+    /// be enforced. Unset and null mean the same thing here.
+    /// </summary>
+    internal static JsonElement WithoutNullMembers(JsonElement output)
+    {
+        if (output.ValueKind != JsonValueKind.Object)
+            return output.Clone();
+        var members = new Dictionary<string, object?>();
+        foreach (var prop in output.EnumerateObject())
+        {
+            if (prop.Value.ValueKind != JsonValueKind.Null)
+                members[prop.Name] = prop.Value;
+        }
+        return SdkJson.SerializeToElement(members);
     }
 
     private async Task<object> HandleMcpMessageAsync(JsonElement request, CancellationToken cancellationToken)

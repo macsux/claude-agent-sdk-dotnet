@@ -15,9 +15,7 @@ public class HookTests(ITestOutputHelper output) : IntegrationTestBase(output)
         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
     };
 
-    [IntegrationFact(Skip = "SDK bug: PreToolUseHookSpecificOutput serialized with default JsonSerializer options emits " +
-                            "\"updatedInput\":null and \"additionalContext\":null; CLI 2.1.280 then ignores the whole hook " +
-                            "decision and the denied Write runs (file is created). Python sends TypedDicts without nulls.")]
+    [IntegrationFact]
     public async Task TypedPreToolUseOutput_DefaultSerialization_DenyIsEnforced()
     {
         var target = Path.Combine(Cwd, "typed-deny.txt");

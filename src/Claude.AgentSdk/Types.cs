@@ -1105,9 +1105,11 @@ public record McpStdioServerConfig
     public required string Command { get; init; }
 
     [JsonPropertyName("args")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? Args { get; init; }
 
     [JsonPropertyName("env")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyDictionary<string, string>? Env { get; init; }
 }
 
@@ -1123,6 +1125,7 @@ public record McpSSEServerConfig
     public required string Url { get; init; }
 
     [JsonPropertyName("headers")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
 }
 
@@ -1138,6 +1141,7 @@ public record McpHttpServerConfig
     public required string Url { get; init; }
 
     [JsonPropertyName("headers")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyDictionary<string, string>? Headers { get; init; }
 }
 
@@ -1334,33 +1338,42 @@ public record SandboxNetworkConfig
 {
     /// <summary>Domain names that sandboxed processes can access. Python commit 92a4615.</summary>
     [JsonPropertyName("allowedDomains")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? AllowedDomains { get; init; }
 
     /// <summary>Domains that are always blocked, even if matched by allowedDomains. Python commit 92a4615.</summary>
     [JsonPropertyName("deniedDomains")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? DeniedDomains { get; init; }
 
     /// <summary>When true in managed settings, only managed-settings allowedDomains are respected. Python commit 92a4615.</summary>
     [JsonPropertyName("allowManagedDomainsOnly")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AllowManagedDomainsOnly { get; init; }
 
     [JsonPropertyName("allowUnixSockets")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? AllowUnixSockets { get; init; }
 
     [JsonPropertyName("allowAllUnixSockets")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AllowAllUnixSockets { get; init; }
 
     [JsonPropertyName("allowLocalBinding")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AllowLocalBinding { get; init; }
 
     /// <summary>macOS only: XPC/Mach service names to allow (supports trailing wildcard).</summary>
     [JsonPropertyName("allowMachLookup")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? AllowMachLookup { get; init; }
 
     [JsonPropertyName("httpProxyPort")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? HttpProxyPort { get; init; }
 
     [JsonPropertyName("socksProxyPort")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public int? SocksProxyPort { get; init; }
 }
 
@@ -1370,9 +1383,11 @@ public record SandboxNetworkConfig
 public record SandboxIgnoreViolations
 {
     [JsonPropertyName("file")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? File { get; init; }
 
     [JsonPropertyName("network")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? Network { get; init; }
 }
 
@@ -1382,24 +1397,31 @@ public record SandboxIgnoreViolations
 public record SandboxSettings
 {
     [JsonPropertyName("enabled")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? Enabled { get; init; }
 
     [JsonPropertyName("autoAllowBashIfSandboxed")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AutoAllowBashIfSandboxed { get; init; }
 
     [JsonPropertyName("excludedCommands")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public IReadOnlyList<string>? ExcludedCommands { get; init; }
 
     [JsonPropertyName("allowUnsandboxedCommands")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? AllowUnsandboxedCommands { get; init; }
 
     [JsonPropertyName("network")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public SandboxNetworkConfig? Network { get; init; }
 
     [JsonPropertyName("ignoreViolations")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public SandboxIgnoreViolations? IgnoreViolations { get; init; }
 
     [JsonPropertyName("enableWeakerNestedSandbox")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public bool? EnableWeakerNestedSandbox { get; init; }
 }
 

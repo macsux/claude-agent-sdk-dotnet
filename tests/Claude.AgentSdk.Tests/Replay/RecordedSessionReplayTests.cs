@@ -393,9 +393,7 @@ public class RecordedSessionReplayTests
         Assert.Equal("sdk", server.GetProperty("source").GetString());
     }
 
-    [Fact(Skip = "SDK bug: ListMcpServersAsync deserializes mcp_status into McpStatusResponse, but " +
-                 "McpServerConnectionStatus has no JSON string mapping, so the CLI's \"status\":\"connected\" throws " +
-                 "JsonException (Path: $.mcpServers[0].status).")]
+    [Fact]
     public async Task ListMcpServers_ParsesRecordedServerStatus()
     {
         var fixture = Fixture.Load("mcp_status");

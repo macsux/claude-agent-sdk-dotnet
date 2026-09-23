@@ -82,10 +82,7 @@ public class SessionTests(ITestOutputHelper output) : IntegrationTestBase(output
         Assert.Contains(nonce, result.Result);
     }
 
-    [IntegrationFact(Skip = "SDK bug: ClaudeSessions.ListSessionsAsync(new FileSessionStore(SessionPaths.GetProjectsDir()), cwd) " +
-                            "returns [] for sessions the CLI wrote. ListSessionsAsync prefers ListSessionSummariesAsync whenever the " +
-                            "store implements it, and FileSessionStore only reads .summaries/ sidecars, which the CLI never writes " +
-                            "(no fallback to scanning *.jsonl). The ClaudeSessions docs recommend exactly this store for the on-disk layout.")]
+    [IntegrationFact]
     public async Task ClaudeSessions_ListFindsJustCreatedSessionOnDisk()
     {
         var nonce = NewNonce("CODE");
@@ -125,9 +122,7 @@ public class SessionTests(ITestOutputHelper output) : IntegrationTestBase(output
         Assert.All(messages, m => Assert.True(Guid.TryParse(m.Uuid, out _)));
     }
 
-    [IntegrationFact(Skip = "SDK bug: ClaudeSessions.GetSessionInfoAsync returns LastModified = 0: it folds the entries with " +
-                            "no mtime (SessionSummary.FoldSessionSummary(null, key, entries)). Python's " +
-                            "get_session_info_from_store uses the last entry's timestamp (falling back to now).")]
+    [IntegrationFact]
     public async Task ClaudeSessions_GetSessionInfo_ReportsLastModified()
     {
         var seed = await PlantAsync(NewNonce("CODE"), Options(), suffix: null);

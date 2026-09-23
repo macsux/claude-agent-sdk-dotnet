@@ -94,9 +94,7 @@ public class OptionsTests(ITestOutputHelper output) : IntegrationTestBase(output
         Assert.Contains("maximum budget", pex.Message);
     }
 
-    [IntegrationFact(Skip = "SDK bug: after an is_error result the SDK throws a plain ProcessException " +
-                            "(QueryHandler.ReadMessagesLoopAsync), never the public ResultException that carries " +
-                            "Subtype/Errors; Python raises ResultError(subtype=...) in the same situation.")]
+    [IntegrationFact]
     public async Task ErrorResult_SurfacesAsTypedResultException()
     {
         var options = Options() with { MaxBudgetUsd = 0.000001m };

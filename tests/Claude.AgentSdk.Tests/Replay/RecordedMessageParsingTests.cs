@@ -144,9 +144,7 @@ public class RecordedMessageParsingTests
         }
     }
 
-    [Fact(Skip = "SDK bug: MessageParser has no case for system/task_updated, so the real CLI frame (seen in " +
-                 "Fixtures/subagent.jsonl) is surfaced as a plain SystemMessage and the public TaskUpdatedMessage type is " +
-                 "never produced. Python's message_parser returns TaskUpdatedMessage(task_id, patch, status).")]
+    [Fact]
     public void TaskUpdated_ParsesAsTaskUpdatedMessage()
     {
         var raw = Fixture.Load("subagent").Incoming.Single(m =>
@@ -158,10 +156,7 @@ public class RecordedMessageParsingTests
         Assert.True(TaskStatus.IsTerminal(msg.Status));
     }
 
-    [Fact(Skip = "SDK bug: UserMessage.GetContentBlocks() throws NotSupportedException ('must specify a type " +
-                 "discriminator') for real CLI tool results. It deserializes each block with the polymorphic ContentBlock " +
-                 "contract, which requires \"type\" to be the first property; the CLI writes successful tool results as " +
-                 "{\"tool_use_id\":...,\"type\":\"tool_result\",...} (e.g. Fixtures/mcp_tool_call.jsonl, hook_post_tool_use.jsonl).")]
+    [Fact]
     public void UserMessage_GetContentBlocks_ParsesRealCliToolResults()
     {
         var checkedResults = 0;

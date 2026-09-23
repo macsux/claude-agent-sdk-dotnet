@@ -18,9 +18,9 @@ namespace Claude.AgentSdk.Internal;
 /// <summary>
 /// Source-generated metadata for every SDK type that crosses a JSON boundary,
 /// plus the scalar types a wire payload may carry. Uses the same options as
-/// <see cref="JsonSerializerOptions.Default"/> (no naming policy, nulls
-/// written) so the output is byte-identical to the reflection serializer the
-/// SDK used before it was made AOT-compatible.
+/// <see cref="JsonSerializerOptions.Default"/> (no naming policy; nulls
+/// written unless a member opts out) so the output matches the reflection
+/// serializer the SDK used before it was made AOT-compatible.
 /// </summary>
 [JsonSourceGenerationOptions]
 // Scalars (so SdkJson can write any of them through GetTypeInfo(Type)).
@@ -73,6 +73,15 @@ namespace Claude.AgentSdk.Internal;
 [JsonSerializable(typeof(SessionSummaryEntry))]
 [JsonSerializable(typeof(SessionStoreListEntry))]
 [JsonSerializable(typeof(SessionListSubkeysKey))]
+// Typed hook outputs (HookOutput.HookSpecificOutput).
+[JsonSerializable(typeof(PreToolUseHookSpecificOutput))]
+[JsonSerializable(typeof(PostToolUseHookSpecificOutput))]
+[JsonSerializable(typeof(PostToolUseFailureHookSpecificOutput))]
+[JsonSerializable(typeof(UserPromptSubmitHookSpecificOutput))]
+[JsonSerializable(typeof(SessionStartHookSpecificOutput))]
+[JsonSerializable(typeof(NotificationHookSpecificOutput))]
+[JsonSerializable(typeof(SubagentStartHookSpecificOutput))]
+[JsonSerializable(typeof(PermissionRequestHookSpecificOutput))]
 // In-process MCP server results.
 [JsonSerializable(typeof(McpToolAnnotations))]
 [JsonSerializable(typeof(McpToolResult))]

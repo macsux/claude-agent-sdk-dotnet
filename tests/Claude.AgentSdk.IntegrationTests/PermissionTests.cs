@@ -168,9 +168,7 @@ public class PermissionTests(ITestOutputHelper output) : IntegrationTestBase(out
         Assert.Single(calls);
     }, Log);
 
-    [IntegrationFact(Skip = "SDK bug: PermissionMode.DontAsk (and .Auto) are public enum values but " +
-                            "SubprocessTransport.PermissionModeToCliValue has no case for them, so ConnectAsync throws " +
-                            "ArgumentOutOfRangeException(\"Unsupported permission mode\") before the CLI is spawned.")]
+    [IntegrationFact]
     public async Task PermissionModeOption_DontAsk_DeniesWithoutPrompting()
     {
         // PermissionMode.DontAsk is a public enum value (Python "dontAsk"): tools that are

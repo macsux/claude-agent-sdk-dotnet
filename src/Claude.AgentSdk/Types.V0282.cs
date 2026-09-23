@@ -258,6 +258,9 @@ public record HookEventMessage : SystemMessage
 #region MCP Status Types (T20)
 
 /// <summary>Connection status values for an MCP server.</summary>
+/// <remarks>Serialized as the CLI's strings: <c>"connected"</c>, <c>"failed"</c>,
+/// <c>"needs-auth"</c>, <c>"pending"</c>, <c>"disabled"</c>.</remarks>
+[JsonConverter(typeof(McpServerConnectionStatusJsonConverter))]
 public enum McpServerConnectionStatus
 {
     Connected,
@@ -267,8 +270,37 @@ public enum McpServerConnectionStatus
     Disabled
 }
 
+/// <summary>
+/// Maps <see cref="McpServerConnectionStatus"/> to and from the CLI's wire strings
+/// (Python: <c>Literal["connected", "failed", "needs-auth", "pending", "disabled"]</c>).
+/// </summary>
+internal sealed class McpServerConnectionStatusJsonConverter : JsonConverter<McpServerConnectionStatus>
+{
+    public override McpServerConnectionStatus Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+    {
+        if (reader.TokenType != JsonTokenType.String)
+            throw new JsonException($"Expected a string MCP server status, got {reader.TokenType}.");
+        var value = reader.GetString();
+        return McpEnumHelpers.ParseConnectionStatus(value)
+               ?? throw new JsonException($"Unknown MCP server status '{value}'.");
+    }
+
+    public override void Write(Utf8JsonWriter writer, McpServerConnectionStatus value, JsonSerializerOptions options) =>
+        writer.WriteStringValue(value.ToJsonString());
+}
+
 internal static class McpEnumHelpers
 {
+    public static McpServerConnectionStatus? ParseConnectionStatus(string? value) => value switch
+    {
+        "connected" => McpServerConnectionStatus.Connected,
+        "failed" => McpServerConnectionStatus.Failed,
+        "needs-auth" => McpServerConnectionStatus.NeedsAuth,
+        "pending" => McpServerConnectionStatus.Pending,
+        "disabled" => McpServerConnectionStatus.Disabled,
+        _ => null
+    };
+
     public static string ToJsonString(this McpServerConnectionStatus s) => s switch
     {
         McpServerConnectionStatus.Connected => "connected",
@@ -529,6 +561,13 @@ public record SDKControlPermissionRequest
 /// </summary>
 public record PreToolUseHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.PreToolUseHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "PreToolUse";
 
@@ -536,15 +575,19 @@ public record PreToolUseHookSpecificOutput
     /// Permission decision: "allow", "deny", "ask", or "defer". Python commit f5a1b67.
     /// </summary>
     [JsonPropertyName("permissionDecision")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? PermissionDecision { get; init; }
 
     [JsonPropertyName("permissionDecisionReason")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? PermissionDecisionReason { get; init; }
 
     [JsonPropertyName("updatedInput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? UpdatedInput { get; init; }
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 }
 
@@ -553,74 +596,131 @@ public record PreToolUseHookSpecificOutput
 /// </summary>
 public record PostToolUseHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.PostToolUseHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "PostToolUse";
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 
     /// <summary>Replaces the tool output before it is sent to the model. Python commit b0b652f.</summary>
     [JsonPropertyName("updatedToolOutput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? UpdatedToolOutput { get; init; }
 
     /// <summary>Replaces the output for MCP tools only. Prefer UpdatedToolOutput. Python commit b0b652f.</summary>
     [JsonPropertyName("updatedMCPToolOutput")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public JsonElement? UpdatedMCPToolOutput { get; init; }
 }
 
 /// <summary>Hook-specific output for PostToolUseFailure events. Python: <c>PostToolUseFailureHookSpecificOutput</c>.</summary>
 public record PostToolUseFailureHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.PostToolUseFailureHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "PostToolUseFailure";
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 }
 
 /// <summary>Hook-specific output for UserPromptSubmit events. Python: <c>UserPromptSubmitHookSpecificOutput</c>.</summary>
 public record UserPromptSubmitHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.UserPromptSubmitHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "UserPromptSubmit";
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 }
 
 /// <summary>Hook-specific output for SessionStart events. Python: <c>SessionStartHookSpecificOutput</c>.</summary>
 public record SessionStartHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.SessionStartHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "SessionStart";
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 }
 
 /// <summary>Hook-specific output for Notification events. Python: <c>NotificationHookSpecificOutput</c>.</summary>
 public record NotificationHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.NotificationHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "Notification";
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 }
 
 /// <summary>Hook-specific output for SubagentStart events. Python: <c>SubagentStartHookSpecificOutput</c>.</summary>
 public record SubagentStartHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.SubagentStartHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "SubagentStart";
 
     [JsonPropertyName("additionalContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 }
 
 /// <summary>Hook-specific output for PermissionRequest events. Python: <c>PermissionRequestHookSpecificOutput</c>.</summary>
 public record PermissionRequestHookSpecificOutput
 {
+    /// <summary>
+    /// This output as the JSON element for <see cref="HookOutput.HookSpecificOutput"/>, with unset
+    /// members omitted. Uses source-generated metadata, so it is trim- and NativeAOT-safe.
+    /// </summary>
+    public JsonElement ToJsonElement() =>
+        JsonSerializer.SerializeToElement(this, Internal.SdkJsonContext.Default.PermissionRequestHookSpecificOutput);
+
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "PermissionRequest";
 
