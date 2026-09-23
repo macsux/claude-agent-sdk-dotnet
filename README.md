@@ -157,13 +157,18 @@ var options = Claude.Options()
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `SystemPrompt` | `string?` | Custom system prompt |
+| `SystemPrompt` | `SystemPromptConfig?` | A string (implicit), `SystemPromptPreset`, `SystemPromptCustom` or `SystemPromptFile` |
 | `MaxTurns` | `int?` | Maximum conversation turns |
 | `MaxBudgetUsd` | `decimal?` | Spending limit in USD |
 | `Model` | `string?` | Model to use |
 | `FallbackModel` | `string?` | Fallback model |
-| `PermissionMode` | `PermissionMode?` | Default, AcceptEdits, BypassPermissions |
-| `McpServers` | `object?` | MCP server configurations |
+| `PermissionMode` | `PermissionMode?` | Default, AcceptEdits, Plan, BypassPermissions, DontAsk, Auto |
+| `McpServers` | `McpServersConfig?` | A `Dictionary<string, object>` of servers (implicit) or a config path / JSON string |
+| `Skills` | `SkillsConfig?` | `"all"` or a list of skill names (both implicit) |
+| `ResumeSessionAt` / `ResumeDropsTurn` | `string?` | Truncating resume (`--resume-session-at` / `--resume-drops-turn`) |
+| `ForwardSubagentText` | `bool` | Forward subagent text/thinking blocks |
+| `VerbatimPrompts` | `bool` | Mark prompts `client_composed` (no `@path` expansion / slash commands) |
+| `LoadTimeoutMs` | `int` | SessionStore load timeout during resume (default 60000) |
 | `CanUseTool` | `CanUseToolCallback?` | Tool permission callback |
 | `Hooks` | `IReadOnlyDictionary<...>?` | Event hooks |
 | `AllowedTools` | `IReadOnlyList<string>` | Whitelist tools |
