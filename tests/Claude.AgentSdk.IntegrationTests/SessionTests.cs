@@ -115,7 +115,7 @@ public class SessionTests(ITestOutputHelper output) : IntegrationTestBase(output
         Assert.Equal(Cwd, single.Cwd);
         Log($"LastModified={single.LastModified}"); // see ClaudeSessions_GetSessionInfo_ReportsLastModified
 
-        var messages = await ClaudeSessions.GetSessionMessagesAsync(store, seed.SessionId, Cwd, Ct);
+        var messages = await ClaudeSessions.GetSessionMessagesAsync(store, seed.SessionId, Cwd, cancellationToken: Ct);
         Assert.True(messages.Count >= 2, $"expected user + assistant messages, got {messages.Count}");
         var first = messages[0];
         Assert.Equal("user", first.Type);
@@ -163,7 +163,7 @@ public class SessionTests(ITestOutputHelper output) : IntegrationTestBase(output
         // The store is queryable through the public session API.
         var listed = await ClaudeSessions.ListSessionsAsync(store, Cwd, cancellationToken: Ct);
         Assert.Contains(listed, s => s.SessionId == seed.SessionId);
-        var storedMessages = await ClaudeSessions.GetSessionMessagesAsync(store, seed.SessionId, Cwd, Ct);
+        var storedMessages = await ClaudeSessions.GetSessionMessagesAsync(store, seed.SessionId, Cwd, cancellationToken: Ct);
         Assert.Contains(storedMessages, m => m.Type == "user" && m.MessageData.GetRawText().Contains(nonce));
 
         // Remove the CLI's local copy: a successful recall now proves the resume was

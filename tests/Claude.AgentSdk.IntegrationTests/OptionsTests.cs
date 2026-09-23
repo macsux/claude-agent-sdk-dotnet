@@ -198,7 +198,7 @@ public class OptionsTests(ITestOutputHelper output) : IntegrationTestBase(output
     public async Task SystemPrompt_PresetVsString_ChangesSystemPromptSize()
     {
         // No model call: compare the CLI's own accounting of the system prompt.
-        async Task<int> SystemPromptTokens(object? systemPrompt)
+        async Task<int> SystemPromptTokens(SystemPromptConfig? systemPrompt)
         {
             var options = Options() with { SystemPrompt = systemPrompt };
             await using var client = new ClaudeSDKClient(options);
