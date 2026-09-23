@@ -29,7 +29,7 @@ public sealed class McpSdkServerBuilderTests
 
         var result = await config.Handlers.CallTool!(
             "add",
-            JsonSerializer.SerializeToElement(new { A = 2, B = 3 }),
+            JsonSerializer.SerializeToElement(new { a = 2, b = 3 }),
             CancellationToken.None
         );
 
@@ -60,7 +60,7 @@ public sealed class McpSdkServerBuilderTests
 
         var result = await config.Handlers.CallTool!(
             "add",
-            JsonSerializer.SerializeToElement(new { A = 10, B = 20 }),
+            JsonSerializer.SerializeToElement(new { a = 10, b = 20 }),
             CancellationToken.None
         );
 
