@@ -410,19 +410,37 @@ public static class SessionResume
     }
 
     /// <summary>Read a regular file, or return <c>null</c> when missing or
-    /// unreadable (best-effort; never aborts the resume).</summary>
-    private static byte[]? ReadIfPresent(string src)
+    /// unreadable (best-effort; never aborts the resume). Mirrors Python
+    /// <c>_read_if_present</c>, which refuses anything that is not a regular file
+    /// (a directory, or a FIFO/device where a file was expected) so an unreadable
+    /// one cannot abort -- or, for a FIFO, hang -- the resume.</summary>
+    internal static byte[]? ReadIfPresent(string src)
     {
         try
         {
             var info = new FileInfo(src);
             if (!info.Exists) return null; // missing, or a directory
+            if (!IsRegularFile(info)) return null;
             return File.ReadAllBytes(src);
         }
         catch
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Best-effort <c>S_ISREG</c>: .NET exposes no file-type bits, and opening a FIFO for
+    /// reading blocks until a writer appears, so special files must be rejected before
+    /// opening. FIFOs, sockets and character/block devices all stat with size 0 (a pipe's
+    /// size is never meaningful), so anything empty is skipped: an empty config file
+    /// carries nothing to copy, and skipping it is the only way to be sure not to hang.
+    /// </summary>
+    private static bool IsRegularFile(FileInfo info)
+    {
+        if ((info.Attributes & FileAttributes.Directory) != 0) return false;
+        if (OperatingSystem.IsWindows()) return (info.Attributes & FileAttributes.Device) == 0;
+        return info.Length > 0;
     }
 
     private static void CopyIfPresent(string src, string dst, Func<byte[], byte[]>? transform = null)

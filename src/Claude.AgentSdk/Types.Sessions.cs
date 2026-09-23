@@ -145,12 +145,25 @@ public record SDKSessionInfo
 /// A user or assistant message from a session transcript. Python commit reference:
 /// SessionMessage in types.py.
 /// </summary>
+/// <param name="Type"><c>"user"</c> or <c>"assistant"</c>.</param>
+/// <param name="Uuid">Unique message identifier.</param>
+/// <param name="SessionId">ID of the session this message belongs to (the entry's <c>sessionId</c>).</param>
+/// <param name="MessageData">Raw Anthropic API message (role, content, ...); a JSON <c>null</c> when the entry has none.</param>
+/// <param name="ParentToolUseId">
+/// For subagent messages, the id of the Agent <c>tool_use</c> in the parent session that spawned
+/// the subagent (from its metadata; null if unavailable). Always null for top-level session messages.
+/// </param>
+/// <param name="ParentAgentId">
+/// For subagent messages, the agent id of the subagent that spawned this one, or null if it was
+/// spawned by the main session (or the metadata is unavailable). Always null for top-level messages.
+/// </param>
 public record SessionMessage(
     [property: JsonPropertyName("type")] string Type,
     [property: JsonPropertyName("uuid")] string Uuid,
     [property: JsonPropertyName("session_id")] string SessionId,
     [property: JsonPropertyName("message")] JsonElement MessageData,
-    [property: JsonPropertyName("parent_tool_use_id")] string? ParentToolUseId = null
+    [property: JsonPropertyName("parent_tool_use_id")] string? ParentToolUseId = null,
+    [property: JsonPropertyName("parent_agent_id")] string? ParentAgentId = null
 );
 
 /// <summary>

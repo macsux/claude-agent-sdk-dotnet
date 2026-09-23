@@ -31,8 +31,12 @@ public sealed class McpSdkServerBuilder
     /// <list type="bullet">
     /// <item><description><c>(T1 a, T2 b, CancellationToken ct) => TResult</c></description></item>
     /// <item><description><c>(T1 a, T2 b) => Task&lt;TResult&gt;</c></description></item>
-    /// <item><description><c>(TArgs args) => TResult</c> (single complex param binds from the whole JSON args object)</description></item>
+    /// <item><description><c>(TArgs args) => TResult</c> (a single POCO/record/dictionary param binds from the whole JSON args object;
+    /// a single collection, enum, Guid, DateTime, ... param is an ordinary named property)</description></item>
     /// </list>
+    /// Parameters with a default value, and nullable parameters (<c>int?</c>, <c>string?</c>), are optional;
+    /// nullable ones also accept an explicit JSON <c>null</c>. Recursive parameter types are supported
+    /// (the schema is cut at the point of recursion with a permissive <c>{"type": "object"}</c>).
     /// </remarks>
     public McpSdkServerBuilder Tool(string name, Delegate handler, string? description = null, McpToolAnnotations? annotations = null)
     {
@@ -88,7 +92,9 @@ public sealed class McpSdkServerBuilder
     {
         private static readonly JsonSerializerOptions ToolJsonOptions = new()
         {
-            PropertyNameCaseInsensitive = true
+            PropertyNameCaseInsensitive = true,
+            // The schema advertises enums by name, so bind (and report) them by name too.
+            Converters = { new JsonStringEnumConverter() }
         };
 
         private readonly Delegate _handler;
@@ -149,11 +155,11 @@ public sealed class McpSdkServerBuilder
             switch (value)
             {
                 case McpToolResult toolResult:
-                    return toolResult;
+                    return new McpToolResult { Content = ConvertContent(toolResult.Content), IsError = toolResult.IsError };
                 case McpContent content:
-                    return new McpToolResult { Content = [content] };
+                    return new McpToolResult { Content = ConvertContent([content]) };
                 case IEnumerable<McpContent> contents:
-                    return new McpToolResult { Content = contents.ToList() };
+                    return new McpToolResult { Content = ConvertContent(contents) };
                 case null:
                     return McpToolResults.Text("");
                 case string s:
@@ -165,6 +171,47 @@ public sealed class McpSdkServerBuilder
                         return McpToolResults.Text(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? "");
                     return McpToolResults.Text(JsonSerializer.Serialize(value, ToolJsonOptions));
             }
+        }
+
+        /// <summary>
+        /// Map a handler's content to what the CLI renders (Python <c>_convert_tool_content</c>):
+        /// text and image blocks pass through, resource links and text resources are flattened to
+        /// text, and binary resources and unknown block types are dropped.
+        /// </summary>
+        internal static IReadOnlyList<McpContent> ConvertContent(IEnumerable<McpContent>? items)
+        {
+            var content = new List<McpContent>();
+            if (items == null)
+                return content;
+
+            foreach (var item in items)
+            {
+                if (item == null)
+                    continue;
+                switch (item.Type)
+                {
+                    case "text":
+                        content.Add(new McpContent { Type = "text", Text = item.Text ?? "" });
+                        break;
+                    case "image":
+                        content.Add(new McpContent { Type = "image", Data = item.Data, MimeType = item.MimeType });
+                        break;
+                    case "resource_link":
+                        content.Add(McpContents.Text(string.IsNullOrEmpty(item.Text) ? "Resource link" : item.Text));
+                        break;
+                    case "resource" when item.Text != null:
+                        content.Add(McpContents.Text(item.Text));
+                        break;
+                    case "resource":
+                        System.Diagnostics.Trace.TraceWarning("Binary embedded resource cannot be converted to text, skipping");
+                        break;
+                    default:
+                        System.Diagnostics.Trace.TraceWarning($"Unsupported content type '{item.Type}' in tool result, skipping");
+                        break;
+                }
+            }
+
+            return content;
         }
 
         private static bool IsSimpleScalar(Type type)
@@ -238,9 +285,10 @@ public sealed class McpSdkServerBuilder
                 var hasCt = allParams.Length > 0 && allParams[^1].ParameterType == typeof(CancellationToken);
                 var logicalParams = hasCt ? allParams[..^1] : allParams;
 
-                var bindWhole = false;
-                if (logicalParams.Length == 1 && IsComplexObject(logicalParams[0].ParameterType))
-                    bindWhole = true;
+                // Only a POCO/record/dictionary binds from the whole arguments object; a single
+                // List<T>, Guid, DateTime, enum, ... is an ordinary named property.
+                var bindWhole = logicalParams.Length == 1 &&
+                                McpSchemaGenerator.IsObjectLike(logicalParams[0].ParameterType);
 
                 var parameters = logicalParams
                     .Select(p => new BindingParameter(p))
@@ -253,7 +301,9 @@ public sealed class McpSdkServerBuilder
             {
                 if (_bindWholeObject && _parameters.Count == 1)
                 {
-                    var schema = McpSchemaGenerator.GenerateForType(_parameters[0].ParameterType);
+                    // The root of a tool input schema is always an object (never nullable).
+                    var p0 = _parameters[0];
+                    var schema = McpSchemaGenerator.Generate(p0.ParameterType, allowsNull: false, p0.Nullability);
                     return JsonSerializer.SerializeToElement(schema, ToolJsonOptions);
                 }
 
@@ -262,7 +312,10 @@ public sealed class McpSdkServerBuilder
 
                 foreach (var p in _parameters)
                 {
-                    properties[p.JsonName] = McpSchemaGenerator.GenerateForType(p.ParameterType);
+                    var propSchema = McpSchemaGenerator.Generate(p.ParameterType, p.AllowsNull, p.Nullability);
+                    if (!string.IsNullOrWhiteSpace(p.Description))
+                        propSchema["description"] = p.Description;
+                    properties[p.JsonName] = propSchema;
                     if (p.IsRequired)
                         required.Add(p.JsonName);
                 }
@@ -344,6 +397,15 @@ public sealed class McpSdkServerBuilder
                 if (targetType == typeof(JsonElement))
                     return element.Clone();
 
+                if (element.ValueKind == JsonValueKind.Null)
+                {
+                    if (!targetType.IsValueType || Nullable.GetUnderlyingType(targetType) != null)
+                        return null;
+                    throw new ArgumentException($"null is not a valid value for {targetType.Name}.");
+                }
+
+                targetType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
                 if (targetType == typeof(string))
                     return element.ValueKind == JsonValueKind.Null ? null : element.GetString();
 
@@ -372,6 +434,9 @@ public sealed class McpSdkServerBuilder
                     {
                         if (element.TryGetInt64(out var l))
                             return Convert.ChangeType(l, Nullable.GetUnderlyingType(targetType) ?? targetType, System.Globalization.CultureInfo.InvariantCulture);
+                        // jsonschema accepts an integral float (2.0) as an integer; so does binding.
+                        if (element.TryGetDecimal(out var integral) && decimal.Truncate(integral) == integral)
+                            return Convert.ChangeType(integral, targetType, System.Globalization.CultureInfo.InvariantCulture);
                     }
                     else
                     {
@@ -422,28 +487,18 @@ public sealed class McpSdkServerBuilder
                     _ => false
                 };
             }
-
-            private static bool IsComplexObject(Type t)
-            {
-                t = Nullable.GetUnderlyingType(t) ?? t;
-                if (t == typeof(string)) return false;
-                if (t == typeof(JsonElement)) return false;
-                if (t.IsPrimitive) return false;
-                if (t.IsEnum) return false;
-                return Type.GetTypeCode(t) == TypeCode.Object;
-            }
         }
 
         private sealed class BindingParameter
         {
-            private static readonly NullabilityInfoContext Nullability = new();
-
             public string JsonName { get; }
             public Type ParameterType { get; }
             public bool HasDefaultValue { get; }
             public object? DefaultValue { get; }
             public bool AllowsNull { get; }
             public bool IsRequired { get; }
+            public NullabilityInfo Nullability { get; }
+            public string? Description { get; }
 
             public BindingParameter(ParameterInfo p)
             {
@@ -454,24 +509,50 @@ public sealed class McpSdkServerBuilder
                 HasDefaultValue = p.HasDefaultValue;
                 DefaultValue = p.HasDefaultValue ? p.DefaultValue : null;
 
-                var nullability = Nullability.Create(p);
-                AllowsNull = nullability.WriteState == NullabilityState.Nullable ||
-                             Nullable.GetUnderlyingType(ParameterType) != null;
+                // NullabilityInfoContext is not thread-safe; registration is cheap enough for one per call.
+                Nullability = new NullabilityInfoContext().Create(p);
+                AllowsNull = McpSchemaGenerator.AllowsNull(ParameterType, Nullability);
+                Description = p.GetCustomAttribute<DescriptionAttribute>()?.Description;
 
                 IsRequired = !HasDefaultValue && !AllowsNull;
             }
         }
     }
 
-    private static class McpSchemaGenerator
+    /// <summary>
+    /// JSON Schema generation for tool parameters (the .NET counterpart of Python's
+    /// <c>_python_type_to_json_schema</c> / <c>_typeddict_to_json_schema</c>).
+    /// </summary>
+    /// <remarks>
+    /// Python emits Optional[X] as the schema of X (None is dropped from the union) and leaves the
+    /// field out of <c>required</c> only for NotRequired TypedDict keys, so jsonschema rejects an
+    /// explicit null. Here a parameter or property that is nullable (<c>int?</c>, or an NRT
+    /// <c>string?</c>/<c>Foo?</c>) is both left out of <c>required</c> and allows null
+    /// (<c>{"type": ["integer", "null"]}</c>): the model often sends null for an optional
+    /// argument, and the handler can accept it.
+    /// </remarks>
+    internal static class McpSchemaGenerator
     {
-        private static readonly NullabilityInfoContext Nullability = new();
+        // Beyond this nesting the schema is truncated to a permissive one (keeping the JSON well
+        // under System.Text.Json's default max depth of 64), which also stops
+        // generic types that expand forever (Foo<T> { Foo<List<T>> Next }).
+        private const int MaxDepth = 12;
 
-        public static object GenerateForType(Type type)
+        /// <summary>Schema for <paramref name="type"/>, allowing null when <paramref name="allowsNull"/>.</summary>
+        public static Dictionary<string, object?> Generate(Type type, bool allowsNull, NullabilityInfo? nullability = null)
+            => Generate(type, allowsNull, nullability, new Stack<Type>());
+
+        private static Dictionary<string, object?> Generate(Type type, bool allowsNull, NullabilityInfo? nullability, Stack<Type> path)
+        {
+            var schema = GenerateCore(type, nullability, path);
+            return allowsNull ? MakeNullable(schema) : schema;
+        }
+
+        private static Dictionary<string, object?> GenerateCore(Type type, NullabilityInfo? nullability, Stack<Type> path)
         {
             type = Nullable.GetUnderlyingType(type) ?? type;
 
-            if (type == typeof(JsonElement) || type == typeof(object))
+            if (IsPermissive(type))
                 return new Dictionary<string, object?>();
 
             if (type.IsEnum)
@@ -481,7 +562,7 @@ public sealed class McpSdkServerBuilder
                     ["enum"] = Enum.GetNames(type)
                 };
 
-            if (type == typeof(string))
+            if (type == typeof(string) || type == typeof(char))
                 return new Dictionary<string, object?> { ["type"] = "string" };
 
             if (type == typeof(bool))
@@ -496,53 +577,100 @@ public sealed class McpSdkServerBuilder
             if (type == typeof(DateTime) || type == typeof(DateTimeOffset))
                 return new Dictionary<string, object?> { ["type"] = "string", ["format"] = "date-time" };
 
+            if (type == typeof(DateOnly))
+                return new Dictionary<string, object?> { ["type"] = "string", ["format"] = "date" };
+
+            if (type == typeof(TimeOnly))
+                return new Dictionary<string, object?> { ["type"] = "string", ["format"] = "time" };
+
+            if (type == typeof(TimeSpan) || type == typeof(Version))
+                return new Dictionary<string, object?> { ["type"] = "string" };
+
+            // System.Text.Json reads and writes byte[] as a base64 string.
+            if (type == typeof(byte[]))
+                return new Dictionary<string, object?> { ["type"] = "string", ["contentEncoding"] = "base64" };
+
             if (IsIntegral(type))
                 return new Dictionary<string, object?> { ["type"] = "integer" };
 
-            if (IsNumber(type))
+            if (IsFloating(type))
                 return new Dictionary<string, object?> { ["type"] = "number" };
 
+            if (path.Count >= MaxDepth)
+                return new Dictionary<string, object?>();
+
+            // Dictionaries before enumerables: a dictionary is also IEnumerable<KeyValuePair<,>>.
+            if (TryGetDictionaryValueType(type, out var valueType))
+            {
+                var valueNullability = nullability is { GenericTypeArguments.Length: 2 } ? nullability.GenericTypeArguments[1] : null;
+                path.Push(type);
+                try
+                {
+                    return new Dictionary<string, object?>
+                    {
+                        ["type"] = "object",
+                        ["additionalProperties"] = Generate(valueType, AllowsNull(valueType, valueNullability), valueNullability, path)
+                    };
+                }
+                finally { path.Pop(); }
+            }
+
             if (TryGetEnumerableElementType(type, out var elementType))
-                return new Dictionary<string, object?>
-                {
-                    ["type"] = "array",
-                    ["items"] = GenerateForType(elementType)
-                };
+            {
+                if (elementType == null)
+                    return new Dictionary<string, object?> { ["type"] = "array" };
 
-            if (TryGetStringDictionaryValueType(type, out var valueType))
-                return new Dictionary<string, object?>
+                var elementNullability = type.IsArray
+                    ? nullability?.ElementType
+                    : nullability is { GenericTypeArguments.Length: 1 } ? nullability.GenericTypeArguments[0] : null;
+                path.Push(type);
+                try
                 {
-                    ["type"] = "object",
-                    ["additionalProperties"] = GenerateForType(valueType)
-                };
+                    return new Dictionary<string, object?>
+                    {
+                        ["type"] = "array",
+                        ["items"] = Generate(elementType, AllowsNull(elementType, elementNullability), elementNullability, path)
+                    };
+                }
+                finally { path.Pop(); }
+            }
 
-            return GenerateObjectSchema(type);
+            // A type that contains itself (directly or through other types): cut the cycle with
+            // a permissive object schema instead of recursing until the stack overflows.
+            if (path.Contains(type))
+                return new Dictionary<string, object?> { ["type"] = "object" };
+
+            path.Push(type);
+            try
+            {
+                return GenerateObjectSchema(type, path);
+            }
+            finally { path.Pop(); }
         }
 
-        private static object GenerateObjectSchema(Type type)
+        private static Dictionary<string, object?> GenerateObjectSchema(Type type, Stack<Type> path)
         {
-            var props = type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
-                .Where(p => p.GetMethod != null && p.GetMethod.IsPublic)
-                .Where(p => p.GetIndexParameters().Length == 0)
-                .ToArray();
-
             var properties = new Dictionary<string, object?>(StringComparer.Ordinal);
             var required = new List<string>();
 
-            foreach (var prop in props)
+            foreach (var prop in GetBindableProperties(type))
             {
                 var jsonName = prop.GetCustomAttribute<JsonPropertyNameAttribute>()?.Name
                                ?? JsonNamingPolicy.CamelCase.ConvertName(prop.Name);
 
-                properties[jsonName] = GenerateForType(prop.PropertyType);
+                var nullability = new NullabilityInfoContext().Create(prop);
+                var allowsNull = AllowsNull(prop.PropertyType, nullability);
 
-                var nullability = Nullability.Create(prop);
-                var allowsNull = nullability.WriteState == NullabilityState.Nullable ||
-                                 Nullable.GetUnderlyingType(prop.PropertyType) != null;
+                var propSchema = Generate(prop.PropertyType, allowsNull, nullability, path);
+                var description = prop.GetCustomAttribute<DescriptionAttribute>()?.Description;
+                if (!string.IsNullOrWhiteSpace(description))
+                    propSchema["description"] = description;
+                properties[jsonName] = propSchema;
 
-                var requiredByAttr = prop.GetCustomAttribute<RequiredAttribute>() != null;
-                var requiredByNullability = !allowsNull;
-                if (requiredByAttr || requiredByNullability)
+                var requiredByAttr = prop.GetCustomAttribute<RequiredAttribute>() != null ||
+                                     prop.GetCustomAttribute<JsonRequiredAttribute>() != null ||
+                                     prop.GetCustomAttribute<System.Runtime.CompilerServices.RequiredMemberAttribute>() != null;
+                if (requiredByAttr || !allowsNull)
                     required.Add(jsonName);
             }
 
@@ -562,34 +690,111 @@ public sealed class McpSdkServerBuilder
             return schema;
         }
 
-        private static bool IsIntegral(Type t) => Type.GetTypeCode(t) switch
+        // Properties System.Text.Json can populate: public, non-indexer, not [JsonIgnore], and
+        // either settable (set/init) or bound through a constructor parameter of the same name.
+        private static IEnumerable<PropertyInfo> GetBindableProperties(Type type)
         {
-            TypeCode.Byte => true,
-            TypeCode.SByte => true,
-            TypeCode.Int16 => true,
-            TypeCode.UInt16 => true,
-            TypeCode.Int32 => true,
-            TypeCode.UInt32 => true,
-            TypeCode.Int64 => true,
-            TypeCode.UInt64 => true,
-            _ => false
-        };
+            var ctorParamNames = new HashSet<string>(
+                type.GetConstructors(BindingFlags.Public | BindingFlags.Instance)
+                    .SelectMany(c => c.GetParameters())
+                    .Select(p => p.Name!)
+                    .Where(n => n != null),
+                StringComparer.OrdinalIgnoreCase);
 
-        private static bool IsNumber(Type t) => Type.GetTypeCode(t) switch
-        {
-            TypeCode.Single => true,
-            TypeCode.Double => true,
-            TypeCode.Decimal => true,
-            _ => false
-        };
+            return type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                .Where(p => p.GetMethod is { IsPublic: true } && p.GetIndexParameters().Length == 0)
+                .Where(p => p.GetCustomAttribute<JsonIgnoreAttribute>() is not { Condition: JsonIgnoreCondition.Always })
+                .Where(p => p.SetMethod is { IsPublic: true } || ctorParamNames.Contains(p.Name) ||
+                            p.GetCustomAttribute<JsonIncludeAttribute>() != null);
+        }
 
-        private static bool TryGetEnumerableElementType(Type type, out Type elementType)
+        /// <summary>
+        /// Whether a value of <paramref name="type"/> may be null: <c>Nullable&lt;T&gt;</c>, or a
+        /// reference type annotated nullable. NRT-oblivious reference types are treated as non-null.
+        /// </summary>
+        public static bool AllowsNull(Type type, NullabilityInfo? nullability)
         {
-            if (type == typeof(string))
-            {
-                elementType = typeof(void);
+            if (Nullable.GetUnderlyingType(type) != null)
+                return true;
+            if (type.IsValueType)
                 return false;
-            }
+            return nullability?.ReadState == NullabilityState.Nullable ||
+                   nullability?.WriteState == NullabilityState.Nullable;
+        }
+
+        private static Dictionary<string, object?> MakeNullable(Dictionary<string, object?> schema)
+        {
+            // A schema without "type" already accepts null.
+            if (!schema.TryGetValue("type", out var t))
+                return schema;
+
+            schema["type"] = t switch
+            {
+                string s => new[] { s, "null" },
+                _ => t
+            };
+            if (schema.TryGetValue("enum", out var e) && e is string[] names)
+                schema["enum"] = names.Cast<object?>().Append(null).ToArray();
+            return schema;
+        }
+
+        /// <summary>
+        /// True for types that bind from the whole tool arguments object when they are a tool's
+        /// only parameter: POCOs, records and string-keyed dictionaries. Collections, scalars and
+        /// well-known value types (Guid, Uri, DateTime, ...) are named parameters instead.
+        /// </summary>
+        public static bool IsObjectLike(Type type)
+        {
+            type = Nullable.GetUnderlyingType(type) ?? type;
+            if (IsPermissive(type) || IsScalar(type))
+                return false;
+            if (TryGetDictionaryValueType(type, out _))
+                return true;
+            if (TryGetEnumerableElementType(type, out _))
+                return false;
+            return type.IsClass || (type.IsValueType && !type.IsPrimitive) || type.IsInterface;
+        }
+
+        private static bool IsPermissive(Type type) =>
+            type == typeof(JsonElement) || type == typeof(object) || type == typeof(JsonDocument) ||
+            type == typeof(System.Text.Json.Nodes.JsonNode) || type == typeof(System.Text.Json.Nodes.JsonValue);
+
+        private static bool IsScalar(Type type) =>
+            type.IsPrimitive || type.IsEnum || type == typeof(string) || type == typeof(decimal) ||
+            type == typeof(Guid) || type == typeof(Uri) || type == typeof(DateTime) ||
+            type == typeof(DateTimeOffset) || type == typeof(DateOnly) || type == typeof(TimeOnly) ||
+            type == typeof(TimeSpan) || type == typeof(Version) || type == typeof(byte[]) ||
+            type == typeof(Half) || type == typeof(Int128) || type == typeof(UInt128);
+
+        private static bool IsIntegral(Type t) =>
+            t == typeof(Int128) || t == typeof(UInt128) || Type.GetTypeCode(t) switch
+            {
+                TypeCode.Byte => true,
+                TypeCode.SByte => true,
+                TypeCode.Int16 => true,
+                TypeCode.UInt16 => true,
+                TypeCode.Int32 => true,
+                TypeCode.UInt32 => true,
+                TypeCode.Int64 => true,
+                TypeCode.UInt64 => true,
+                _ => false
+            };
+
+        private static bool IsFloating(Type t) =>
+            t == typeof(Half) || Type.GetTypeCode(t) switch
+            {
+                TypeCode.Single => true,
+                TypeCode.Double => true,
+                TypeCode.Decimal => true,
+                _ => false
+            };
+
+        // elementType is null for a non-generic IEnumerable (an array of anything).
+        private static bool TryGetEnumerableElementType(Type type, out Type? elementType)
+        {
+            elementType = null;
+            if (type == typeof(string))
+                return false;
 
             if (type.IsArray)
             {
@@ -597,38 +802,42 @@ public sealed class McpSdkServerBuilder
                 return true;
             }
 
-            var enumerable = type.GetInterfaces()
-                .Concat([type])
-                .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IEnumerable<>));
-
+            var enumerable = FindGenericInterface(type, typeof(IEnumerable<>));
             if (enumerable != null)
             {
                 elementType = enumerable.GetGenericArguments()[0];
                 return true;
             }
 
-            elementType = typeof(void);
-            return false;
+            return typeof(System.Collections.IEnumerable).IsAssignableFrom(type);
         }
 
-        private static bool TryGetStringDictionaryValueType(Type type, out Type valueType)
+        private static bool TryGetDictionaryValueType(Type type, out Type valueType)
         {
-            var dict = type.GetInterfaces()
-                .Concat([type])
-                .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == typeof(IDictionary<,>));
-
+            var dict = FindGenericInterface(type, typeof(IDictionary<,>)) ??
+                       FindGenericInterface(type, typeof(IReadOnlyDictionary<,>));
             if (dict != null)
             {
-                var args = dict.GetGenericArguments();
-                if (args[0] == typeof(string))
-                {
-                    valueType = args[1];
-                    return true;
-                }
+                valueType = dict.GetGenericArguments()[1];
+                return true;
+            }
+
+            if (typeof(System.Collections.IDictionary).IsAssignableFrom(type))
+            {
+                valueType = typeof(object);
+                return true;
             }
 
             valueType = typeof(void);
             return false;
+        }
+
+        private static Type? FindGenericInterface(Type type, Type genericDefinition)
+        {
+            if (type.IsGenericType && type.GetGenericTypeDefinition() == genericDefinition)
+                return type;
+            return type.GetInterfaces()
+                .FirstOrDefault(i => i.IsGenericType && i.GetGenericTypeDefinition() == genericDefinition);
         }
     }
 }
