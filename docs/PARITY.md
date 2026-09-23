@@ -60,7 +60,7 @@ Reference: `claude-agent-sdk-python` **0.2.158** (bundled CLI 2.1.280),
 | `output_format` | `OutputFormat` | `--json-schema` | ok |
 | `enable_file_checkpointing` | `EnableFileCheckpointing` | env `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING=true` | ok |
 | `session_store` / `session_store_flush` | `SessionStore` / `SessionStoreFlush` | `--session-mirror` + mirror batcher | ok |
-| `load_timeout_ms` | `LoadTimeoutMs` (default 60000) | `SessionResume.MaterializeResumeSessionAsync(options, loadTimeout)` from `QueryAsync` and `ClaudeSDKClient.ConnectAsync` | added (≤0 → 1 tick, see follow-ups) |
+| `load_timeout_ms` | `LoadTimeoutMs` (default 60000) | `SessionResume.MaterializeResumeSessionAsync(options, loadTimeout)` from `QueryAsync` and `ClaudeSDKClient.ConnectAsync` | added (≤0 → immediate timeout, as in Python) |
 | `task_budget` | `TaskBudget` | `--task-budget` | ok |
 | — | `--input-format stream-json`, `--output-format stream-json --verbose` | always | ok |
 
@@ -171,21 +171,22 @@ Out of scope for this pass (listed for completeness):
 
 ## Follow-ups
 
-1. **Sessions** (`Sessions/SessionResume.cs`): `MaterializeResumeSessionAsync(options, TimeSpan)`
-   throws for a non-positive timeout, while Python treats `load_timeout_ms <= 0` as an immediate
-   timeout. The option plumbing currently maps `<= 0` to one tick; accepting `TimeSpan.Zero` there
-   would let it pass the value through unchanged.
+1. ~~**Sessions**: non-positive `load_timeout_ms`~~ — resolved: `MaterializeResumeSessionAsync`
+   accepts `TimeSpan.Zero` (and negative spans) as an immediate timeout and `LoadTimeoutMs` is
+   passed through unclamped.
 2. **Sessions**: Python's local-disk `fork_session()` has no .NET counterpart (only
    `SessionMutations.ForkSessionViaStoreAsync`).
-3. **MCP** (`Internal/QueryHandler.HandleMcpMessageAsync` / `SdkMcpBridge`): Python answers a
-   JSON-RPC *notification* carried in `mcp_message` with `{"jsonrpc":"2.0","result":{}}` and uses
-   the error text `Server '<name>' not found`; left untouched here because the MCP bridge is being
-   reworked concurrently.
+3. ~~**MCP** notification ack / unknown-server text~~ — resolved: `SdkMcpBridge.HandleAsync`
+   returns no reply for notifications and `QueryHandler` acks them with
+   `{"jsonrpc":"2.0","result":{}}`; unknown servers answer `Server '<name>' not found`.
 4. **MCP**: `McpServerRegistry` derives from `Dictionary<string, object>`, so map values stay
    `object`. A typed `McpServerConfig` base for `McpStdio/SSE/Http/SdkServerConfig` would allow a
    fully typed server map.
 5. **Tests**: `McpPythonParityTests.CancelledNotification_CancelsTheInFlightCall` failed once in
    several full-suite runs (it passes in isolation and on re-runs); looks timing-dependent.
-6. **AOT**: `ClaudeJsonContext` does not list `ConversationResetMessage` / `RateLimitEvent` as
-   polymorphic `Message` subtypes; serializing those through the `Message` base is unsupported.
-   Out of scope until the AOT pass.
+6. **AOT**: the library is `IsAotCompatible` (zero trim/AOT warnings; NativeAOT smoke test in
+   `tests/Claude.AgentSdk.AotSmoke`). Wire JSON goes through the internal `SdkJsonContext` /
+   `SdkJson`; the older `ClaudeJsonContext` is unused by the SDK (messages are parsed by hand) and
+   still does not list `ConversationResetMessage` / `RateLimitEvent`.
+   `McpSdkServerBuilder.Tool(string, Delegate, ...)` requires reflection; use the explicit-schema or
+   `JsonTypeInfo<TArgs>` overloads in trimmed/AOT apps.

@@ -129,6 +129,39 @@ var options = Claude.Options()
     .Build();
 ```
 
+### Trimming and NativeAOT
+
+The library is trim- and NativeAOT-compatible (`IsAotCompatible`). The delegate-based
+`Tool(name, Delegate, ...)` shown above infers schemas by reflection and is annotated
+`[RequiresUnreferencedCode]`; in trimmed/AOT apps register tools with an explicit JSON schema or
+with source-generated `JsonTypeInfo<TArgs>`:
+
+```csharp
+var schema = JsonDocument.Parse("""
+    {"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}},"required":["a","b"]}
+    """).RootElement;
+
+var options = Claude.Options()
+    .McpServers(m => m.AddSdk("calculator", s => s
+        // Raw JSON arguments, validated against the schema.
+        .Tool("add", schema, (args, ct) => Task.FromResult(McpToolResults.Text(
+            (args.GetProperty("a").GetDouble() + args.GetProperty("b").GetDouble()).ToString())))
+        // Typed arguments; the schema is exported from the same metadata.
+        .Tool("mul", MyJsonContext.Default.MulArgs, (m, ct) => Task.FromResult(McpToolResults.Text((m.X * m.Y).ToString())))))
+    .Build();
+
+record MulArgs(int X, int Y);
+
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(MulArgs))]
+partial class MyJsonContext : JsonSerializerContext;
+```
+
+Values placed in `Dictionary<string, object?>` payloads (prompt streams, MCP `_meta`) should be
+primitives, collections, `JsonElement` or `JsonNode`; other objects need reflection-based
+serialization, which trimmed/AOT apps disable. Typed hook outputs have `ToJsonElement()`.
+`tests/Claude.AgentSdk.AotSmoke` publishes a NativeAOT app that exercises this surface.
+
 ### Custom Agents
 
 ```csharp

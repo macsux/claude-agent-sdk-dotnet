@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    NativeAOT smoke test for Claude.AgentSdk. Publishing must produce zero trim/AOT
+    warnings, and the native binary must exit 0:
+
+      dotnet publish tests/Claude.AgentSdk.AotSmoke -c Release -r osx-arm64
+      tests/Claude.AgentSdk.AotSmoke/bin/Release/net10.0/osx-arm64/publish/Claude.AgentSdk.AotSmoke
+
+    No Claude CLI is needed: the control protocol runs over an in-memory ITransport.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Report every trim/AOT warning individually (not one per assembly) and fail on any. -->
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningsAsErrors>$(WarningsAsErrors);IL2026;IL2046;IL2057;IL2060;IL2062;IL2067;IL2070;IL2072;IL2075;IL2087;IL2091;IL2104;IL3050;IL3051;IL3053;IL3056</WarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Claude.AgentSdk\Claude.AgentSdk.csproj" />
+  </ItemGroup>
+
+  <!-- Real CLI transcripts recorded by the integration suite; parsed through the public API. -->
+  <ItemGroup>
+    <Content Include="..\Claude.AgentSdk.Tests\Fixtures\*.jsonl"
+             LinkBase="fixtures"
+             CopyToOutputDirectory="PreserveNewest"
+             CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

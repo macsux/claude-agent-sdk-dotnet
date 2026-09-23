@@ -57,6 +57,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HookEvents", "examples\exte
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Claude.AgentSdk.IntegrationTests", "tests\Claude.AgentSdk.IntegrationTests\Claude.AgentSdk.IntegrationTests.csproj", "{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Claude.AgentSdk.AotSmoke", "tests\Claude.AgentSdk.AotSmoke\Claude.AgentSdk.AotSmoke.csproj", "{D49C8421-124D-43E7-9DCB-B6888084DFA9}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -331,6 +333,18 @@ Global
 		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x64.Build.0 = Release|Any CPU
 		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x86.ActiveCfg = Release|Any CPU
 		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x86.Build.0 = Release|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Debug|x64.Build.0 = Debug|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Debug|x86.Build.0 = Debug|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Release|x64.ActiveCfg = Release|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Release|x64.Build.0 = Release|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Release|x86.ActiveCfg = Release|Any CPU
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -360,5 +374,6 @@ Global
 		{7C834417-8A1B-41C1-B75D-7C36FFE1DFCB} = {09499393-0251-FC88-284D-312889A601B1}
 		{F0F09C30-D961-405C-BD0E-C433D12F037D} = {09499393-0251-FC88-284D-312889A601B1}
 		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8} = {C4D5E6F7-A8B9-0123-4567-890ABCDEF012}
+		{D49C8421-124D-43E7-9DCB-B6888084DFA9} = {C4D5E6F7-A8B9-0123-4567-890ABCDEF012}
 	EndGlobalSection
 EndGlobal
