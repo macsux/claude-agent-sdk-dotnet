@@ -36,6 +36,19 @@ jobs:
     - name: Build
       run: dotnet build --configuration Release --no-restore
 
+    # Unit tests only: deterministic, free, no Claude CLI required. Live-CLI
+    # tests live in tests/Claude.AgentSdk.IntegrationTests and run from
+    # integration.yml (they also self-skip without CLAUDE_AGENT_SDK_RUN_INTEGRATION_TESTS=1).
+    - name: Unit tests
+      run: dotnet test tests/Claude.AgentSdk.Tests --configuration Release --no-build --logger "trx;LogFileName=unit.trx" --results-directory ./test-results
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: unit-test-results-${{ matrix.os }}
+        path: ./test-results
+
   package:
     name: Package
     runs-on: ubuntu-latest

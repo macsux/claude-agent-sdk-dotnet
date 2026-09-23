@@ -31,7 +31,7 @@ jobs:
       run: dotnet build --configuration Release --no-restore
 
     - name: Run tests
-      run: dotnet test --configuration Release --no-build --verbosity normal --filter "FullyQualifiedName!~IntegrationTests"
+      run: dotnet test tests/Claude.AgentSdk.Tests --configuration Release --no-build --verbosity normal
 
     - name: Pack
       run: dotnet pack src/Claude.AgentSdk/Claude.AgentSdk.csproj --configuration Release --no-build --output ./artifacts

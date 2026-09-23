@@ -1,0 +1,81 @@
+name: Integration
+
+# Runs the live-CLI test category (tests/Claude.AgentSdk.IntegrationTests)
+# against a pinned Claude Code CLI. These tests have real latency, are
+# non-deterministic, and cost money, so they never run on ordinary pushes:
+#   - manually (Actions → Integration → Run workflow), or
+#   - on a pull request carrying the `run-integration` label.
+# Requires the ANTHROPIC_API_KEY repository secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      cli_version:
+        description: Claude Code CLI version to test against
+        required: false
+        default: '2.1.280'
+      model:
+        description: Model for integration tests (defaults to the suite's cheap model)
+        required: false
+        default: ''
+  pull_request:
+    types: [labeled, synchronize]
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_NOLOGO: true
+  # Keep in sync with the Python SDK's bundled CLI (_cli_version.py) when syncing.
+  PINNED_CLI_VERSION: '2.1.280'
+
+jobs:
+  integration:
+    name: Live CLI tests
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'run-integration')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Install Claude Code CLI (pinned)
+      run: |
+        npm install -g "@anthropic-ai/claude-code@${{ inputs.cli_version || env.PINNED_CLI_VERSION }}"
+        claude -v
+
+    - name: Build
+      run: dotnet build --configuration Release
+
+    - name: Integration tests
+      env:
+        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        CLAUDE_AGENT_SDK_RUN_INTEGRATION_TESTS: '1'
+        CLAUDE_AGENT_SDK_IT_MODEL: ${{ inputs.model }}
+      run: >-
+        dotnet test tests/Claude.AgentSdk.IntegrationTests --configuration Release --no-build
+        --logger "console;verbosity=normal" --logger "trx;LogFileName=integration.trx"
+        --results-directory ./test-results
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: integration-test-results
+        path: ./test-results
