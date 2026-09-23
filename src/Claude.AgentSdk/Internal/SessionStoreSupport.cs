@@ -46,12 +46,11 @@ internal static class SessionStoreSupport
 
     /// <summary>
     /// Load / resume-materialization timeout (Python: <c>load_timeout_ms / 1000</c>
-    /// passed to <c>anyio.fail_after</c>). Python treats 0 or less as an
-    /// immediate timeout; <see cref="SessionResume"/> requires a positive span,
-    /// so those map to the smallest positive one (one tick).
+    /// passed to <c>anyio.fail_after</c>). 0 or less is passed through: like
+    /// Python, <see cref="SessionResume"/> treats it as an immediate timeout.
     /// </summary>
     public static TimeSpan LoadTimeout(ClaudeAgentOptions options) =>
-        options.LoadTimeoutMs > 0 ? TimeSpan.FromMilliseconds(options.LoadTimeoutMs) : TimeSpan.FromTicks(1);
+        TimeSpan.FromMilliseconds(options.LoadTimeoutMs);
 
     /// <summary>Resume a session from the store honoring <see cref="ClaudeAgentOptions.LoadTimeoutMs"/>.</summary>
     public static Task<MaterializedResume?> MaterializeAsync(ClaudeAgentOptions options, CancellationToken cancellationToken) =>

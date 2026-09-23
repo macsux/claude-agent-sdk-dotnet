@@ -27,6 +27,16 @@ internal static class TaskCompat
         string what,
         CancellationToken cancellationToken)
     {
+        // Python: anyio.fail_after(0 or less) — the deadline has already passed.
+        // Fail deterministically instead of racing a store call that may
+        // complete synchronously without observing the token.
+        if (timeout <= TimeSpan.Zero)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new SessionStoreOperationException(
+                $"{what} timed out after {(int)timeout.TotalMilliseconds}ms during resume materialization");
+        }
+
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         cts.CancelAfter(timeout);
         try

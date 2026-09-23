@@ -91,6 +91,8 @@ public static class SessionResume
     /// Overload taking an explicit per-call store timeout (Python
     /// <c>options.load_timeout_ms</c>) applied to each
     /// <c>LoadAsync</c> / <c>ListSessionsAsync</c> / <c>ListSubkeysAsync</c>.
+    /// Zero or a negative span is an immediate timeout (Python: <c>load_timeout_ms &lt;= 0</c>):
+    /// the first store call fails with <see cref="SessionStoreOperationException"/>.
     /// </summary>
     public static async Task<MaterializedResume?> MaterializeResumeSessionAsync(
         ClaudeAgentOptions options,
@@ -100,9 +102,6 @@ public static class SessionResume
         var store = options.SessionStore;
         if (store is null) return null;
         if (options.Resume is null && !options.ContinueConversation) return null;
-        if (loadTimeout <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(loadTimeout), "loadTimeout must be positive");
-
         var timeout = loadTimeout;
         var projectKey = SessionPaths.ProjectKeyForDirectory(options.Cwd);
 

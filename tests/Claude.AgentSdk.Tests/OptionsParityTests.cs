@@ -447,9 +447,34 @@ public sealed class OptionsParityTests
     [Theory]
     [InlineData(0)]
     [InlineData(-5)]
-    public void LoadTimeout_ZeroOrLessIsImmediate(int ms)
+    public async Task LoadTimeout_ZeroOrLessIsImmediate(int ms)
     {
-        Assert.Equal(TimeSpan.FromTicks(1), SessionStoreSupport.LoadTimeout(new ClaudeAgentOptions { LoadTimeoutMs = ms }));
+        // Passed through unclamped; SessionResume treats <= 0 as already expired.
+        Assert.Equal(TimeSpan.FromMilliseconds(ms), SessionStoreSupport.LoadTimeout(new ClaudeAgentOptions { LoadTimeoutMs = ms }));
+
+        // Even a store that answers synchronously times out.
+        var store = new InMemorySessionStore();
+        var options = new ClaudeAgentOptions
+        {
+            SessionStore = store,
+            Resume = "550e8400-e29b-41d4-a716-446655440000",
+            LoadTimeoutMs = ms,
+        };
+        var ex = await Assert.ThrowsAsync<SessionStoreOperationException>(
+            () => SessionStoreSupport.MaterializeAsync(options, CancellationToken.None));
+        Assert.Contains($"timed out after {ms}ms", ex.Message);
+    }
+
+    [Fact]
+    public async Task SessionResume_AcceptsZeroTimeoutAsImmediate()
+    {
+        var options = new ClaudeAgentOptions
+        {
+            SessionStore = new InMemorySessionStore(),
+            Resume = "550e8400-e29b-41d4-a716-446655440000",
+        };
+        await Assert.ThrowsAsync<SessionStoreOperationException>(
+            () => SessionResume.MaterializeResumeSessionAsync(options, TimeSpan.Zero));
     }
 
     private sealed class HangingStore : ISessionStore
