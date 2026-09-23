@@ -4,6 +4,7 @@
 using System.Runtime.CompilerServices;
 using Claude.AgentSdk.Internal;
 using Claude.AgentSdk.Mcp;
+using Claude.AgentSdk.Sessions;
 using Claude.AgentSdk.Transport;
 
 namespace Claude.AgentSdk;
@@ -27,26 +28,6 @@ public static class Claude
     /// </example>
     public static ClaudeAgentOptionsBuilder Options() => new();
 
-    private static bool NeedsControlProtocol(ClaudeAgentOptions options)
-    {
-        if (options.CanUseTool != null)
-            return true;
-
-        if (options.Hooks != null && options.Hooks.Count > 0)
-            return true;
-
-        if (options.McpServers is Dictionary<string, object> servers)
-        {
-            foreach (var (_, config) in servers)
-            {
-                if (config is McpSdkServerConfig)
-                    return true;
-            }
-        }
-
-        return false;
-    }
-
     private static async Task InitializeSdkMcpServersAsync(
         ClaudeAgentOptions options,
         QueryHandler queryHandler,
@@ -68,7 +49,7 @@ public static class Claude
 
     private static async IAsyncEnumerable<Dictionary<string, object?>> SinglePromptStream(
         string prompt,
-        string sessionId = "default",
+        string sessionId = "",
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         await Task.CompletedTask;
@@ -151,27 +132,8 @@ public static class Claude
         ITransport? transport = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        options ??= new ClaudeAgentOptions();
-
-        Environment.SetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT", "sdk-dotnet");
-
-        // Prefer the simpler --print flow when control-protocol features are not in play.
-        // If hooks / can_use_tool / in-process MCP are enabled, we must be able to answer control requests.
-        if (transport == null && !NeedsControlProtocol(options))
-        {
-            await using var printTransport = new SubprocessTransport(prompt, options);
-            await printTransport.ConnectAsync(cancellationToken);
-
-            await foreach (var json in printTransport.ReadMessagesAsync(cancellationToken))
-            {
-                var parsed = MessageParser.ParseOrNull(json);
-                if (parsed != null)
-                    yield return parsed;
-            }
-
-            yield break;
-        }
-
+        // Always streaming (Python/TypeScript parity): the prompt is written to
+        // stdin as a single user message after initialize, never put on argv.
         await foreach (var msg in QueryAsync(SinglePromptStream(prompt, cancellationToken: cancellationToken), options, transport, cancellationToken))
             yield return msg;
     }
@@ -190,27 +152,51 @@ public static class Claude
     {
         options ??= new ClaudeAgentOptions();
 
-        Environment.SetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT", "sdk-dotnet");
+        // Fail fast on invalid SessionStore option combinations before spawning.
+        SessionStoreValidation.Validate(options);
 
-        transport ??= new SubprocessTransport(prompt, options);
-        await transport.ConnectAsync(cancellationToken);
-
-        await using var queryHandler = new QueryHandler(transport, options);
-        await InitializeSdkMcpServersAsync(options, queryHandler, cancellationToken);
-        await queryHandler.StartAsync(cancellationToken);
-        await queryHandler.InitializeAsync(cancellationToken);
-
-        var inputTask = queryHandler.StreamInputAsync(prompt, cancellationToken);
-
+        // resume/continue + SessionStore: load the session from the store into a
+        // temp CLAUDE_CONFIG_DIR for the subprocess to resume from. Skipped for a
+        // custom transport, which never sees the materialized options.
+        var materialized = transport == null
+            ? await SessionResume.MaterializeResumeSessionAsync(options, cancellationToken)
+            : null;
         try
         {
-            await foreach (var message in queryHandler.ReceiveMessagesAsync(cancellationToken))
-                yield return message;
+            var configured = materialized != null
+                ? SessionStoreSupport.ApplyMaterialized(options, materialized)
+                : options;
+
+            transport ??= new SubprocessTransport(prompt, configured);
+            await transport.ConnectAsync(cancellationToken);
+
+            await using var queryHandler = new QueryHandler(transport, configured, SessionStoreSupport.InitializeTimeout());
+            SessionStoreSupport.AttachMirrorBatcher(queryHandler, configured, materialized);
+            await InitializeSdkMcpServersAsync(configured, queryHandler, cancellationToken);
+            await queryHandler.StartAsync(cancellationToken);
+            await queryHandler.InitializeAsync(cancellationToken);
+
+            var inputTask = queryHandler.StreamInputAsync(prompt, cancellationToken);
+
+            try
+            {
+                await foreach (var message in queryHandler.ReceiveMessagesAsync(cancellationToken))
+                    yield return message;
+            }
+            finally
+            {
+                try { await inputTask; } catch { }
+                await transport.DisposeAsync();
+            }
         }
         finally
         {
-            try { await inputTask; } catch { }
-            await transport.DisposeAsync();
+            // The temp dir holds a credentials copy — remove it on every exit
+            // path, after the subprocess has been shut down above.
+            if (materialized != null)
+            {
+                try { await materialized.CleanupAsync(CancellationToken.None); } catch { }
+            }
         }
     }
 }

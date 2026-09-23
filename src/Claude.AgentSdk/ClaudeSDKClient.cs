@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Claude.AgentSdk.Internal;
 using Claude.AgentSdk.Mcp;
+using Claude.AgentSdk.Sessions;
 using Claude.AgentSdk.Transport;
 
 namespace Claude.AgentSdk;
@@ -73,6 +74,7 @@ public class ClaudeSDKClient : IAsyncDisposable
     private ITransport? _transport;
     private QueryHandler? _queryHandler;
     private Task? _inputTask;
+    private MaterializedResume? _materialized;
 
     /// <summary>
     /// Initialize Claude SDK client.
@@ -83,8 +85,6 @@ public class ClaudeSDKClient : IAsyncDisposable
     {
         _options = options ?? new ClaudeAgentOptions();
         _customTransport = transport;
-
-        Environment.SetEnvironmentVariable("CLAUDE_CODE_ENTRYPOINT", "sdk-dotnet-client");
     }
 
     /// <summary>
@@ -140,72 +140,24 @@ public class ClaudeSDKClient : IAsyncDisposable
             }
         }
 
-        // Create transport (ClaudeSDKClient always uses streaming mode)
-        _transport = _customTransport ?? new SubprocessTransport(
-            CreateEmptyStream(),
-            _options.CanUseTool != null
-                ? new ClaudeAgentOptions
-                {
-                    Tools = _options.Tools,
-                    AllowedTools = _options.AllowedTools,
-                    SystemPrompt = _options.SystemPrompt,
-                    McpServers = _options.McpServers,
-                    PermissionMode = _options.PermissionMode,
-                    ContinueConversation = _options.ContinueConversation,
-                    Resume = _options.Resume,
-                    MaxTurns = _options.MaxTurns,
-                    MaxBudgetUsd = _options.MaxBudgetUsd,
-                    DisallowedTools = _options.DisallowedTools,
-                    Model = _options.Model,
-                    FallbackModel = _options.FallbackModel,
-                    Betas = _options.Betas,
-                    PermissionPromptToolName = "stdio", // Required for control protocol
-                    Cwd = _options.Cwd,
-                    CliPath = _options.CliPath,
-                    Settings = _options.Settings,
-                    AddDirs = _options.AddDirs,
-                    Env = _options.Env,
-                    ExtraArgs = _options.ExtraArgs,
-                    MaxBufferSize = _options.MaxBufferSize,
-                    StderrCallback = _options.StderrCallback,
-                    CanUseTool = _options.CanUseTool,
-                    Hooks = _options.Hooks,
-                    User = _options.User,
-                    IncludePartialMessages = _options.IncludePartialMessages,
-                    ForkSession = _options.ForkSession,
-                    Agents = _options.Agents,
-                    SettingSources = _options.SettingSources,
-#pragma warning disable CS0618 // MaxThinkingTokens is obsolete
-                    Sandbox = _options.Sandbox,
-                    Plugins = _options.Plugins,
-                    MaxThinkingTokens = _options.MaxThinkingTokens,
-                    Thinking = _options.Thinking,
-                    Effort = _options.Effort,
-                    OutputFormat = _options.OutputFormat,
-                    EnableFileCheckpointing = _options.EnableFileCheckpointing
-#pragma warning restore CS0618
-                }
-                : _options
-        );
+        // Fail fast on invalid SessionStore option combinations before spawning.
+        SessionStoreValidation.Validate(_options);
 
-        await _transport.ConnectAsync(cancellationToken);
+        // resume/continue + SessionStore: materialize the stored session into a
+        // temp CLAUDE_CONFIG_DIR (skipped for a custom transport).
+        _materialized = _customTransport == null
+            ? await SessionResume.MaterializeResumeSessionAsync(_options, cancellationToken)
+            : null;
 
-        // Calculate initialize timeout
-        var timeoutMs = int.TryParse(
-            Environment.GetEnvironmentVariable("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"),
-            out var ms
-        ) ? ms : 60000;
-        var initializeTimeout = TimeSpan.FromMilliseconds(Math.Max(timeoutMs, 60000));
-
-        // Create query handler
-        _queryHandler = new QueryHandler(_transport, _options, initializeTimeout);
-
-        // Initialize SDK MCP servers (in-process) BEFORE starting query handler
-        // This ensures bridges are ready when the CLI sends MCP messages
-        await InitializeSdkMcpServersAsync(cancellationToken);
-
-        await _queryHandler.StartAsync(cancellationToken);
-        await _queryHandler.InitializeAsync(cancellationToken);
+        try
+        {
+            await ConnectCoreAsync(cancellationToken);
+        }
+        catch
+        {
+            await DisconnectAsync();
+            throw;
+        }
 
         // If we have an initial prompt stream, start streaming it after initialization.
         if (promptStream != null)
@@ -220,6 +172,30 @@ public class ClaudeSDKClient : IAsyncDisposable
             // Back-compat: if a string prompt was provided, send it as the first user message.
             await QueryAsync(prompt, cancellationToken: cancellationToken);
         }
+    }
+
+    private async Task ConnectCoreAsync(CancellationToken cancellationToken)
+    {
+        // The transport adds `--permission-prompt-tool stdio` itself when
+        // CanUseTool is set, so the options are passed through unchanged.
+        var options = _materialized != null
+            ? SessionStoreSupport.ApplyMaterialized(_options, _materialized)
+            : _options;
+
+        // ClaudeSDKClient always uses streaming mode.
+        _transport = _customTransport ?? new SubprocessTransport(CreateEmptyStream(), options);
+
+        await _transport.ConnectAsync(cancellationToken);
+
+        _queryHandler = new QueryHandler(_transport, options, SessionStoreSupport.InitializeTimeout());
+        SessionStoreSupport.AttachMirrorBatcher(_queryHandler, options, _materialized);
+
+        // Initialize SDK MCP servers (in-process) BEFORE starting query handler
+        // This ensures bridges are ready when the CLI sends MCP messages
+        await InitializeSdkMcpServersAsync(cancellationToken);
+
+        await _queryHandler.StartAsync(cancellationToken);
+        await _queryHandler.InitializeAsync(cancellationToken);
     }
 
     private async Task InitializeSdkMcpServersAsync(CancellationToken cancellationToken)
@@ -463,7 +439,24 @@ public class ClaudeSDKClient : IAsyncDisposable
             await _queryHandler.CloseAsync();
             _queryHandler = null;
         }
+        else if (_transport != null)
+        {
+            // Connect failed before the query handler existed.
+            try { await _transport.CloseAsync(); } catch { }
+        }
         _transport = null;
+
+        await CleanupMaterializedAsync();
+    }
+
+    private async Task CleanupMaterializedAsync()
+    {
+        // The temp dir holds a credentials copy; remove it once the CLI is gone.
+        var materialized = Interlocked.Exchange(ref _materialized, null);
+        if (materialized != null)
+        {
+            try { await materialized.CleanupAsync(CancellationToken.None); } catch { }
+        }
     }
 
     /// <inheritdoc />
@@ -480,5 +473,7 @@ public class ClaudeSDKClient : IAsyncDisposable
             await _queryHandler.DisposeAsync();
         if (_transport != null)
             await _transport.DisposeAsync();
+
+        await CleanupMaterializedAsync();
     }
 }

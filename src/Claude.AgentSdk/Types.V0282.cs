@@ -26,7 +26,10 @@ public enum TaskNotificationStatus
 {
     Completed,
     Failed,
-    Stopped
+    Stopped,
+    Killed,
+    /// <summary>A status value this SDK version doesn't recognize; see the raw <c>Data</c>.</summary>
+    Unknown
 }
 
 /// <summary>

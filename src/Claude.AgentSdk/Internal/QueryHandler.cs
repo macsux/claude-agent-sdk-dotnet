@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Channels;
 using Claude.AgentSdk.Mcp;
+using Claude.AgentSdk.Sessions;
 using Claude.AgentSdk.Transport;
 
 namespace Claude.AgentSdk.Internal;
@@ -46,7 +47,18 @@ internal class QueryHandler : IAsyncDisposable
     private readonly Dictionary<string, CancellationTokenSource> _inflightRequests = new();
 
     /// <summary>Mirror callback invoked when the CLI emits transcript_mirror frames.</summary>
+    /// <remarks>Takes precedence over the batcher set via <see cref="SetTranscriptMirrorBatcher"/>.</remarks>
     public Action<JsonElement>? TranscriptMirrorHandler { get; set; }
+
+    // SessionStore mirroring (Python: set_transcript_mirror_batcher).
+    private TranscriptMirrorBatcher? _transcriptMirrorBatcher;
+
+    // Python #1088: delegated agent tasks still running. A result frame ends one
+    // turn, not the run; stdin must stay open while these may still send
+    // hook / SDK-MCP control requests.
+    private readonly HashSet<string> _inflightTasks = new();
+    private static readonly HashSet<string> DeferringTaskTypes = ["local_agent", "local_workflow"];
+    private static readonly HashSet<string> TerminalTaskStatuses = ["completed", "failed", "stopped", "killed"];
 
     public QueryHandler(
         ITransport transport,
@@ -69,6 +81,31 @@ internal class QueryHandler : IAsyncDisposable
     {
         _readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _readTask = ReadMessagesLoopAsync(_readCts.Token);
+    }
+
+    /// <summary>
+    /// Attach a batcher that receives <c>transcript_mirror</c> frames and is
+    /// flushed before each result frame and on shutdown.
+    /// </summary>
+    public void SetTranscriptMirrorBatcher(TranscriptMirrorBatcher batcher) => _transcriptMirrorBatcher = batcher;
+
+    /// <summary>
+    /// Surface a <see cref="ISessionStore.AppendAsync"/> failure as a
+    /// <c>system/mirror_error</c> message. Non-blocking: dropped if the buffer is full.
+    /// </summary>
+    public void ReportMirrorError(SessionKey? key, string error)
+    {
+        var msg = new Dictionary<string, object?>
+        {
+            ["type"] = "system",
+            ["subtype"] = "mirror_error",
+            ["error"] = error,
+            ["key"] = key,
+            ["uuid"] = Guid.NewGuid().ToString(),
+            ["session_id"] = key?.SessionId ?? ""
+        };
+        if (!_messageChannel.Writer.TryWrite(JsonSerializer.SerializeToElement(msg)))
+            System.Diagnostics.Debug.WriteLine($"[QueryHandler] Dropping mirror_error message (buffer full): {error}");
     }
 
     /// <summary>
@@ -121,11 +158,54 @@ internal class QueryHandler : IAsyncDisposable
             ["subtype"] = "initialize",
             ["hooks"] = hooksConfig.Count > 0 ? hooksConfig : null
         };
+        // Python commit 7c6902b: agents travel in the initialize request, not on argv.
+        if (_options.Agents is { Count: > 0 })
+            request["agents"] = BuildAgentsPayload(_options.Agents);
+        if (_options.SystemPrompt is SystemPromptPreset { ExcludeDynamicSections: { } eds })
+            request["excludeDynamicSections"] = eds;
+        // 'all' and omitted are equivalent at the wire level (no filter), so only
+        // send the field when it's an explicit list.
+        var skills = SubprocessTransport.NormalizeSkills(_options.Skills);
+        if (skills != null)
+            request["skills"] = skills;
 
         var response = await SendControlRequestAsync(request, _initializeTimeout, cancellationToken);
         _initialized = true;
         _initializationResult = response;
         return response;
+    }
+
+    /// <summary>
+    /// Serialize agent definitions the way Python does (<c>asdict</c> minus
+    /// <c>None</c> values), with enums in their CLI string form.
+    /// </summary>
+    internal static Dictionary<string, Dictionary<string, object?>> BuildAgentsPayload(
+        IReadOnlyDictionary<string, AgentDefinition> agents)
+    {
+        var result = new Dictionary<string, Dictionary<string, object?>>();
+        foreach (var (name, def) in agents)
+        {
+            var d = new Dictionary<string, object?>
+            {
+                ["description"] = def.Description,
+                ["prompt"] = def.Prompt
+            };
+            if (def.Tools != null) d["tools"] = def.Tools;
+            if (def.DisallowedTools != null) d["disallowedTools"] = def.DisallowedTools;
+            if (def.Model != null) d["model"] = def.Model;
+            if (def.Skills != null) d["skills"] = def.Skills;
+            if (def.Memory != null) d["memory"] = def.Memory;
+            if (def.McpServers != null) d["mcpServers"] = def.McpServers;
+            if (def.InitialPrompt != null) d["initialPrompt"] = def.InitialPrompt;
+            if (def.MaxTurns != null) d["maxTurns"] = def.MaxTurns;
+            if (def.Background != null) d["background"] = def.Background;
+            if (def.Effort != null)
+                d["effort"] = def.Effort is EffortLevel level ? level.ToJsonString() : def.Effort;
+            if (def.PermissionMode != null)
+                d["permissionMode"] = SubprocessTransport.PermissionModeToCliValue(def.PermissionMode.Value);
+            result[name] = d;
+        }
+        return result;
     }
 
     /// <summary>
@@ -160,7 +240,7 @@ internal class QueryHandler : IAsyncDisposable
                     var reqId = message.TryGetProperty("request_id", out var ridElem)
                         ? ridElem.GetString()
                         : null;
-                    if (reqId != null)
+                    if (reqId != null && !_closed)
                     {
                         var cts = new CancellationTokenSource();
                         await _lock.WaitAsync(CancellationToken.None);
@@ -206,14 +286,32 @@ internal class QueryHandler : IAsyncDisposable
                 {
                     // Python commit 6e3d54f: peel mirror frames off stdout and
                     // hand to the SessionStore batcher; do NOT yield to consumers.
-                    TranscriptMirrorHandler?.Invoke(message);
+                    if (TranscriptMirrorHandler != null)
+                        TranscriptMirrorHandler(message);
+                    else if (_transcriptMirrorBatcher != null)
+                        EnqueueTranscriptMirror(message);
                     continue;
                 }
+
+                // Track task lifecycle frames so results can tell "one turn
+                // ended" apart from "the run is done" (Python #1088).
+                if (msgType == "system")
+                    TrackTaskLifecycle(message);
 
                 // Track results for proper stream closure
                 if (msgType == "result")
                 {
-                    _firstResultEvent.TrySetResult();
+                    // Flush pending transcript mirror entries before yielding the
+                    // result so consumers can rely on the store being up to date.
+                    if (_transcriptMirrorBatcher != null)
+                        await _transcriptMirrorBatcher.FlushAsync(CancellationToken.None);
+
+                    // Background tasks still running may need control responses
+                    // over stdin; a later result (with none in flight) closes it.
+                    bool anyInflight;
+                    lock (_inflightTasks) anyInflight = _inflightTasks.Count > 0;
+                    if (!anyInflight)
+                        _firstResultEvent.TrySetResult();
 
                     // Python commit 9aafd84: remember the error text from the
                     // result, then suppress the trailing ProcessError below.
@@ -294,6 +392,12 @@ internal class QueryHandler : IAsyncDisposable
         }
         finally
         {
+            // Flush remaining transcript mirror entries so an early EOF or
+            // transport error doesn't drop entries batched this turn.
+            if (_transcriptMirrorBatcher != null)
+            {
+                try { await _transcriptMirrorBatcher.FlushAsync(CancellationToken.None); } catch { }
+            }
             // Unblock any waiters (e.g. string-prompt path waiting for first result)
             // so they don't stall on early exit.
             _firstResultEvent.TrySetResult();
@@ -304,6 +408,63 @@ internal class QueryHandler : IAsyncDisposable
                 _messageChannel.Writer.TryComplete(finalException);
             else
                 _messageChannel.Writer.TryComplete();
+        }
+    }
+
+    private void EnqueueTranscriptMirror(JsonElement message)
+    {
+        try
+        {
+            var filePath = message.GetProperty("filePath").GetString()!;
+            var entries = JsonSerializer.Deserialize<List<SessionStoreEntry>>(message.GetProperty("entries").GetRawText())
+                ?? [];
+            _transcriptMirrorBatcher!.Enqueue(filePath, entries);
+        }
+        catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or JsonException)
+        {
+            ReportMirrorError(null, $"Malformed transcript_mirror frame: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Track in-flight delegated agent tasks from system lifecycle frames.
+    /// Python: <c>_track_task_lifecycle</c>. Only <c>local_agent</c> /
+    /// <c>local_workflow</c> tasks are tracked: background shells may never
+    /// reach a terminal status and would hold stdin open forever.
+    /// </summary>
+    private void TrackTaskLifecycle(JsonElement message)
+    {
+        if (!message.TryGetProperty("task_id", out var tid) || tid.ValueKind != JsonValueKind.String)
+            return;
+        var taskId = tid.GetString();
+        if (string.IsNullOrEmpty(taskId))
+            return;
+        var subtype = message.TryGetProperty("subtype", out var st) && st.ValueKind == JsonValueKind.String
+            ? st.GetString()
+            : null;
+
+        lock (_inflightTasks)
+        {
+            switch (subtype)
+            {
+                case "task_started":
+                    if (message.TryGetProperty("task_type", out var tt) &&
+                        tt.ValueKind == JsonValueKind.String &&
+                        DeferringTaskTypes.Contains(tt.GetString()!))
+                        _inflightTasks.Add(taskId);
+                    break;
+                case "task_notification":
+                    _inflightTasks.Remove(taskId);
+                    break;
+                case "task_updated":
+                    if (message.TryGetProperty("patch", out var patch) &&
+                        patch.ValueKind == JsonValueKind.Object &&
+                        patch.TryGetProperty("status", out var status) &&
+                        status.ValueKind == JsonValueKind.String &&
+                        TerminalTaskStatuses.Contains(status.GetString()!))
+                        _inflightTasks.Remove(taskId);
+                    break;
+            }
         }
     }
 
@@ -355,7 +516,13 @@ internal class QueryHandler : IAsyncDisposable
                 }
                 else
                 {
-                    tcs.TrySetResult(response);
+                    // Python returns the inner `response` payload (or {}), not
+                    // the {subtype, request_id, response} envelope.
+                    var payload = response.TryGetProperty("response", out var inner) &&
+                                  inner.ValueKind == JsonValueKind.Object
+                        ? inner.Clone()
+                        : JsonSerializer.SerializeToElement(new Dictionary<string, object?>());
+                    tcs.TrySetResult(payload);
                 }
             }
         }
@@ -408,7 +575,14 @@ internal class QueryHandler : IAsyncDisposable
                 }
             };
 
-            await _transport.WriteAsync(JsonSerializer.Serialize(successResponse) + "\n", cancellationToken);
+            // Write with a token that outlives the request: cancelling mid-write
+            // would mark the transport broken for every later write.
+            await _transport.WriteAsync(JsonSerializer.Serialize(successResponse) + "\n", CancellationToken.None);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Request was cancelled via control_cancel_request; the CLI has
+            // already abandoned it, so don't write a response (Python parity).
         }
         catch (Exception ex)
         {
@@ -424,7 +598,15 @@ internal class QueryHandler : IAsyncDisposable
                 }
             };
 
-            await _transport.WriteAsync(JsonSerializer.Serialize(errorResponse) + "\n", cancellationToken);
+            try
+            {
+                await _transport.WriteAsync(JsonSerializer.Serialize(errorResponse) + "\n", CancellationToken.None);
+            }
+            catch (Exception writeEx)
+            {
+                // Fire-and-forget task: don't leave an unobserved exception behind.
+                System.Diagnostics.Debug.WriteLine($"[QueryHandler] Failed to write control error response: {writeEx.Message}");
+            }
         }
     }
 
@@ -439,7 +621,19 @@ internal class QueryHandler : IAsyncDisposable
             ? JsonSerializer.Deserialize<List<PermissionUpdate>>(s.GetRawText())
             : null;
 
-        var context = new ToolPermissionContext(null, suggestions);
+        string? Opt(string name) =>
+            request.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
+
+        var context = new ToolPermissionContext(
+            Signal: null,
+            Suggestions: suggestions,
+            ToolUseId: Opt("tool_use_id"),
+            AgentId: Opt("agent_id"),
+            BlockedPath: Opt("blocked_path"),
+            DecisionReason: Opt("decision_reason"),
+            Title: Opt("title"),
+            DisplayName: Opt("display_name"),
+            Description: Opt("description"));
         var result = await _options.CanUseTool(toolName, input, context, cancellationToken);
 
         if (result is PermissionResultAllow allow)
@@ -732,35 +926,70 @@ internal class QueryHandler : IAsyncDisposable
     }
 
     /// <summary>
-    /// Stream input messages to transport.
+    /// Whether the CLI may still send control requests that need a reply
+    /// (SDK MCP servers, hooks, or a can_use_tool callback). Closing stdin while
+    /// any are configured makes later requests fail CLI-side with "Stream closed".
+    /// </summary>
+    private bool HasBidirectionalNeeds() =>
+        _sdkMcpBridges.Count > 0 ||
+        (_options.Hooks != null && _options.Hooks.Count > 0) ||
+        _options.CanUseTool != null;
+
+    /// <summary>
+    /// Wait for the run-ending result (if bidirectional needs exist) then close
+    /// stdin. No timeout: the control protocol needs stdin for the whole run,
+    /// and the read loop always releases the wait on exit. Python:
+    /// <c>wait_for_result_and_end_input</c>.
+    /// </summary>
+    public async Task WaitForResultAndEndInputAsync(CancellationToken cancellationToken = default)
+    {
+        if (HasBidirectionalNeeds())
+        {
+            try { await _firstResultEvent.Task.WaitAsync(cancellationToken); }
+            catch (OperationCanceledException) { }
+        }
+
+        await _transport.EndInputAsync(CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Stream input messages to transport, then close stdin once the run ends.
     /// </summary>
     public async Task StreamInputAsync(
         IAsyncEnumerable<Dictionary<string, object?>> stream,
         CancellationToken cancellationToken = default)
     {
-        await foreach (var message in stream.WithCancellation(cancellationToken))
+        var written = 0;
+        try
         {
-            if (_closed)
-                break;
-            await _transport.WriteAsync(JsonSerializer.Serialize(message) + "\n", cancellationToken);
-        }
-
-        // If we have SDK MCP servers or hooks, wait for the first result before closing stdin
-        // to allow bidirectional control protocol communication (matches Python behavior).
-        var hasHooks = _options.Hooks != null && _options.Hooks.Count > 0;
-        var hasSdkMcpServers = _sdkMcpBridges.Count > 0;
-        if (hasHooks || hasSdkMcpServers)
-        {
-            try
+            await foreach (var message in stream.WithCancellation(cancellationToken))
             {
-                using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                cts.CancelAfter(TimeSpan.FromSeconds(60));
-                await _firstResultEvent.Task.WaitAsync(cts.Token);
+                if (_closed)
+                    break;
+                await _transport.WriteAsync(JsonSerializer.Serialize(message) + "\n", cancellationToken);
+                written++;
             }
-            catch (OperationCanceledException) { }
+        }
+        catch (Exception ex)
+        {
+            // A user-supplied prompt stream (or the write) failed. Don't leave
+            // stdin open — the CLI would wait for input forever — fall through
+            // and close it like a normal end of input (Python parity).
+            System.Diagnostics.Debug.WriteLine($"[QueryHandler] Prompt stream failed; closing stdin: {ex.Message}");
         }
 
-        await _transport.EndInputAsync(cancellationToken);
+        try
+        {
+            if (written > 0)
+                await WaitForResultAndEndInputAsync(cancellationToken);
+            else
+                // Nothing was sent, so no result will arrive to release the hold.
+                await _transport.EndInputAsync(CancellationToken.None);
+        }
+        catch (Exception ex)
+        {
+            System.Diagnostics.Debug.WriteLine($"[QueryHandler] Error closing input stream: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -813,6 +1042,10 @@ internal class QueryHandler : IAsyncDisposable
         // Python commit 91998d3: close receive stream on disconnect so consumers
         // observing ReceiveMessagesAsync exit cleanly instead of hanging.
         _messageChannel.Writer.TryComplete();
+
+        // Final transcript mirror flush before teardown (never raises).
+        if (_transcriptMirrorBatcher != null)
+            await _transcriptMirrorBatcher.CloseAsync(CancellationToken.None);
 
         await _transport.CloseAsync();
     }

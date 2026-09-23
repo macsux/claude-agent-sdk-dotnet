@@ -131,9 +131,9 @@ internal static class MessageParser
             foreach (var block in contentArray.EnumerateArray())
             {
                 var blockType = block.GetProperty("type").GetString();
-                var contentBlock = blockType switch
+                ContentBlock? contentBlock = blockType switch
                 {
-                    "text" => (ContentBlock)new TextBlock(block.GetProperty("text").GetString()!),
+                    "text" => new TextBlock(block.GetProperty("text").GetString()!),
                     "thinking" => new ThinkingBlock(
                         block.GetProperty("thinking").GetString()!,
                         block.GetProperty("signature").GetString()!
@@ -158,9 +158,12 @@ internal static class MessageParser
                         block.GetProperty("tool_use_id").GetString()!,
                         block.GetProperty("content").Clone()
                     ),
-                    _ => throw new MessageParseException($"Unknown content block type: {blockType}", data)
+                    // Python skips block types it doesn't know (forward compatibility
+                    // with newer CLIs) instead of failing the whole message.
+                    _ => null
                 };
-                contentBlocks.Add(contentBlock);
+                if (contentBlock != null)
+                    contentBlocks.Add(contentBlock);
             }
 
             AssistantMessageError? error = null;
@@ -243,7 +246,9 @@ internal static class MessageParser
                         "completed" => TaskNotificationStatus.Completed,
                         "failed" => TaskNotificationStatus.Failed,
                         "stopped" => TaskNotificationStatus.Stopped,
-                        _ => throw new MessageParseException($"Unknown task_notification status: {statusStr}", data)
+                        "killed" => TaskNotificationStatus.Killed,
+                        // Python passes the raw status through; never fail the stream on a new value.
+                        _ => TaskNotificationStatus.Unknown
                     };
                     return new TaskNotificationMessage
                     {

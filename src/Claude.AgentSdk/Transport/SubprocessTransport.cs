@@ -15,8 +15,8 @@ namespace Claude.AgentSdk.Transport;
 public class SubprocessTransport : ITransport
 {
     private const int DefaultMaxBufferSize = 1024 * 1024; // 1MB
+    private const int ReadChunkSize = 64 * 1024;
     private const string MinimumClaudeCodeVersion = "2.0.0";
-    private static readonly int CmdLengthLimit = OperatingSystem.IsWindows() ? 8000 : 100000;
 
     // Python commit f2389ec: track live subprocesses so we can terminate them
     // when the parent process exits. Mirrors Python atexit cleanup.
@@ -44,20 +44,18 @@ public class SubprocessTransport : ITransport
         }
     }
 
-    private readonly object _prompt;
-    private readonly bool _isStreaming;
     private readonly ClaudeAgentOptions _options;
     private string? _cliPath; // Python commit 19e1f53: deferred CLI discovery to ConnectAsync.
     private readonly string? _cwd;
     private readonly int _maxBufferSize;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private readonly List<string> _tempFiles = [];
 
     private Process? _process;
     private StreamWriter? _stdin;
     private StreamReader? _stdout;
     private StreamReader? _stderr;
     private Task? _stderrTask;
+    private CancellationTokenSource? _stderrCts;
     private bool _ready;
     private Exception? _exitError;
 
@@ -66,12 +64,13 @@ public class SubprocessTransport : ITransport
     /// <summary>
     /// Create a new subprocess transport.
     /// </summary>
-    /// <param name="prompt">The prompt (string for one-shot, or IAsyncEnumerable for streaming).</param>
+    /// <param name="prompt">
+    /// Unused; kept for source compatibility. The CLI always runs in streaming
+    /// mode (Python parity) and prompts are written to stdin by the caller.
+    /// </param>
     /// <param name="options">Configuration options.</param>
     public SubprocessTransport(object prompt, ClaudeAgentOptions options)
     {
-        _prompt = prompt;
-        _isStreaming = prompt is not string;
         _options = options;
         // Python commit 19e1f53: defer CLI discovery to ConnectAsync so tests
         // and dry-run builders can construct without an installed CLI.
@@ -92,57 +91,59 @@ public class SubprocessTransport : ITransport
         if (!string.IsNullOrEmpty(cliPathEnv) && File.Exists(cliPathEnv))
             return cliPathEnv;
 
-        // Check PATH
-        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
-        var pathDirs = pathEnv.Split(Path.PathSeparator);
-
-        // On Windows, npm installs claude.cmd (batch wrapper), not claude.exe
-        var cliNames = OperatingSystem.IsWindows()
-            ? new[] { "claude.cmd", "claude.exe", "claude" }
-            : new[] { "claude" };
-
-        foreach (var dir in pathDirs)
+        // Check PATH. Python: shutil.which("claude"), preferring a native
+        // executable on Windows over npm's claude.cmd shim (which ConnectAsync
+        // refuses to run — see RejectWindowsBatchCli).
+        string? whichHit = null;
+        var hit = Which("claude");
+        if (hit != null)
         {
-            foreach (var cliName in cliNames)
-            {
-                var fullPath = Path.Combine(dir, cliName);
-                if (File.Exists(fullPath))
-                    return fullPath;
-            }
+            if (!OperatingSystem.IsWindows() || IsWindowsNativeExe(hit))
+                return hit;
+            var exe = Which("claude.exe");
+            if (exe != null && IsWindowsNativeExe(exe))
+                return exe;
+            whichHit = hit;
         }
 
         // Check common locations
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
-        var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
 
+        // Windows: only the native installer's claude.exe (Python parity). The
+        // npm .cmd shims are deliberately not probed.
         var locations = OperatingSystem.IsWindows()
-            ? new[]
-            {
-                // Windows native installation locations
-                Path.Combine(home, ".local", "bin", "claude.exe"),
-                Path.Combine(localAppData, "Claude", "claude.exe"),
-                // Windows npm global locations
-                Path.Combine(appData, "npm", "claude.cmd"),
-                Path.Combine(appData, "npm", "claude.exe"),
-                Path.Combine(home, ".npm-global", "bin", "claude.cmd"),
-                Path.Combine(home, ".claude", "local", "claude.exe"),
-                Path.Combine(home, "node_modules", ".bin", "claude.cmd"),
-            }
+            ? new[] { Path.Combine(home, ".local", "bin", "claude.exe") }
             : new[]
             {
                 Path.Combine(home, ".npm-global", "bin", "claude"),
+                "/usr/local/bin/claude",
                 Path.Combine(home, ".local", "bin", "claude"),
                 Path.Combine(home, "node_modules", ".bin", "claude"),
                 Path.Combine(home, ".yarn", "bin", "claude"),
                 Path.Combine(home, ".claude", "local", "claude"),
-                "/usr/local/bin/claude"
             };
 
         foreach (var path in locations)
         {
             if (File.Exists(path))
                 return path;
+        }
+
+        // No native executable anywhere: return the shim so ConnectAsync raises
+        // the explanatory batch-script refusal rather than a bare not-found.
+        if (whichHit != null)
+            return whichHit;
+
+        if (OperatingSystem.IsWindows())
+        {
+            throw new CliNotFoundException(
+                "Claude Code not found. Install the native claude.exe with (PowerShell):\n" +
+                "  irm https://claude.ai/install.ps1 | iex\n" +
+                "\nOr provide the path to a claude.exe via ClaudeAgentOptions:\n" +
+                "  new ClaudeAgentOptions { CliPath = @\"C:\\path\\to\\claude.exe\" }\n" +
+                "\n(npm install -g @anthropic-ai/claude-code produces a claude.cmd shim, " +
+                "which this SDK refuses to run on Windows.)"
+            );
         }
 
         throw new CliNotFoundException(
@@ -161,6 +162,200 @@ public class SubprocessTransport : ITransport
 
         var bundledPath = Path.Combine(assemblyDir, "_bundled", cliName);
         return File.Exists(bundledPath) ? bundledPath : null;
+    }
+
+    /// <summary>
+    /// Minimal <c>shutil.which</c>: search PATH for an executable file named
+    /// <paramref name="name"/> (applying PATHEXT on Windows when the name has
+    /// no extension).
+    /// </summary>
+    private static string? Which(string name)
+    {
+        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
+        string[] candidates = [name];
+        if (OperatingSystem.IsWindows() && !Path.HasExtension(name))
+        {
+            var pathExt = Environment.GetEnvironmentVariable("PATHEXT");
+            var exts = string.IsNullOrEmpty(pathExt) ? ".COM;.EXE;.BAT;.CMD" : pathExt;
+            candidates = exts.Split(';', StringSplitOptions.RemoveEmptyEntries)
+                .Select(ext => name + ext.ToLowerInvariant())
+                .ToArray();
+        }
+
+        foreach (var dir in pathEnv.Split(Path.PathSeparator))
+        {
+            foreach (var candidate in candidates)
+            {
+                var fullPath = Path.Combine(dir, candidate);
+                if (File.Exists(fullPath) && IsExecutable(fullPath))
+                    return fullPath;
+            }
+        }
+        return null;
+    }
+
+    private static bool IsExecutable(string path)
+    {
+        if (OperatingSystem.IsWindows())
+            return true;
+        const UnixFileMode anyExecute = UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute;
+        try { return (File.GetUnixFileMode(path) & anyExecute) != 0; }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// Whether the path's final component names an image CreateProcess runs
+    /// directly (.exe / .com). Only used to rank discovery results; not a
+    /// security gate. Python: <c>_is_windows_native_exe</c>.
+    /// </summary>
+    internal static bool IsWindowsNativeExe(string cliPath)
+    {
+        var name = cliPath.Replace('\\', '/');
+        name = name[(name.LastIndexOf('/') + 1)..].TrimEnd('.', ' ').ToLowerInvariant();
+        return name.EndsWith(".exe") || name.EndsWith(".com");
+    }
+
+    /// <summary>
+    /// Whether any component of <paramref name="cliPath"/> carries a .bat/.cmd
+    /// extension. Classifies every component (split on separators and on ':'
+    /// for NTFS stream specs / drive prefixes) with trailing dots and spaces
+    /// stripped, so Win32 path normalization can't smuggle a batch file past
+    /// the check. Python: <c>_is_windows_batch_cli</c> (platform check applied
+    /// by the caller so this is testable off Windows).
+    /// </summary>
+    internal static bool IsBatchScriptPath(string cliPath)
+    {
+        foreach (var component in cliPath.Replace('\\', '/').Split('/'))
+        {
+            foreach (var segment in component.Split(':'))
+            {
+                var s = segment.TrimEnd('.', ' ').ToLowerInvariant();
+                if (s.EndsWith(".bat") || s.EndsWith(".cmd"))
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Refuse to execute a .bat/.cmd script as the CLI on Windows.
+    /// </summary>
+    /// <remarks>
+    /// CreateProcess runs batch scripts via <c>cmd.exe /c</c>, which re-parses
+    /// the command line. .NET quotes ArgumentList entries for the MSVCRT rules
+    /// only, so cmd.exe metacharacters inside an argument (a prompt, a session
+    /// title passed to --resume, ...) can execute injected commands
+    /// (CVE-2024-27980 "BatBadBut" class). No reliable cmd.exe escaping exists,
+    /// so the only safe option is refusing. Python: <c>_reject_windows_batch_cli</c>.
+    /// </remarks>
+    internal static void RejectWindowsBatchCli(string cliPath, bool isWindows)
+    {
+        if (!isWindows || !IsBatchScriptPath(cliPath))
+            return;
+        throw new CliConnectionException(
+            $"Refusing to execute batch script '{cliPath}': Windows runs .bat/.cmd files via cmd.exe, " +
+            "which can execute commands injected through CLI arguments, and no reliable escaping for " +
+            "cmd.exe exists. Use a native claude executable instead: install Claude Code natively " +
+            "(irm https://claude.ai/install.ps1 | iex) or point ClaudeAgentOptions.CliPath at a claude.exe."
+        );
+    }
+
+    // cmd.exe metacharacters, the quote that toggles its quoting state, and "!"
+    // (delayed expansion). Python: _CMD_EXE_METACHARACTERS.
+    private const string CmdExeMetacharacters = "&|<>^%!\"";
+
+    /// <summary>
+    /// Defense in depth on Windows: reject cmd.exe metacharacters in values that
+    /// applications commonly take from external input (resume / session id).
+    /// Python: <c>_reject_windows_cmd_metacharacters</c>.
+    /// </summary>
+    internal static void RejectWindowsCmdMetacharacters(string optionName, string value, bool isWindows)
+    {
+        if (!isWindows)
+            return;
+        var bad = value.Where(c => CmdExeMetacharacters.Contains(c) || c == '\r' || c == '\n')
+            .Distinct()
+            .OrderBy(c => c)
+            .ToArray();
+        if (bad.Length > 0)
+        {
+            throw new ArgumentException(
+                $"{optionName} value '{value}' contains characters that are unsafe to pass on a " +
+                $"Windows command line: {string.Join(", ", bad.Select(c => $"'{c}'"))}");
+        }
+    }
+
+    // Parentheses and commas delimit --allowedTools rules; control characters
+    // (C0, DEL, C1) and U+FEFF never appear in a skill directory name.
+    // Python: _SKILL_NAME_INVALID_CHARS.
+    private static readonly System.Text.RegularExpressions.Regex SkillNameInvalidChars =
+        new(@"[(),\x00-\x1f\x7f-\x9f﻿]");
+
+    /// <summary>
+    /// Reject skill names that can't ride safely in a <c>Skill(name)</c> rule
+    /// inside the comma-separated <c>--allowedTools</c> value (e.g. a name like
+    /// <c>x),Bash,Skill(y</c> would otherwise grant Bash). Python: <c>_validate_skill_name</c>.
+    /// </summary>
+    internal static void ValidateSkillName(string? name)
+    {
+        if (name is null)
+            throw new ArgumentException("Skill names must be strings, got null");
+        if (string.IsNullOrWhiteSpace(name))
+            throw new ArgumentException("Skill names must be non-empty strings");
+        for (int i = 0; i < name.Length; i++)
+        {
+            if (char.IsHighSurrogate(name[i]) && i + 1 < name.Length && char.IsLowSurrogate(name[i + 1]))
+            {
+                i++;
+                continue;
+            }
+            if (char.IsSurrogate(name[i]))
+                throw new ArgumentException(
+                    $"Invalid skill name '{name}': contains an unpaired surrogate, which can never match a skill the CLI discovered.");
+        }
+        if (name != name.Trim())
+            throw new ArgumentException(
+                $"Invalid skill name '{name}': leading or trailing whitespace can never match — the Skill tool trims the invoked name.");
+        if (SkillNameInvalidChars.IsMatch(name))
+            throw new ArgumentException(
+                $"Invalid skill name '{name}': parentheses, commas, control characters, and byte-order marks are not allowed. " +
+                "Names match the skill's directory name, or 'plugin:skill' for plugin-qualified skills.");
+        if (name == "*")
+            throw new ArgumentException("Invalid skill name '*': use Skills = \"all\" to enable every skill.");
+        if (name.EndsWith(":*") || name.EndsWith(" *"))
+            throw new ArgumentException(
+                $"Invalid skill name '{name}': wildcard-suffix names are not allowed; list each skill by its exact name.");
+        if (name.StartsWith('/'))
+            throw new ArgumentException(
+                $"Invalid skill name '{name}': skill names may not start with '/'. The skills option takes the canonical name, not the slash-command form.");
+        if (name.Contains(@"\\"))
+            throw new ArgumentException(
+                $"Invalid skill name '{name}': consecutive backslashes are not allowed — the per-rule parser collapses them, so the rule would name a different skill.");
+        if (name.EndsWith('\\'))
+            throw new ArgumentException($"Invalid skill name '{name}': names may not end with an unpaired backslash.");
+    }
+
+    /// <summary>
+    /// Reject <see cref="ClaudeAgentOptions.Skills"/> values other than a list of
+    /// names or "all" (a bare string other than "all" would otherwise be silently
+    /// ignored). Python: <c>_reject_non_list_skills</c>.
+    /// </summary>
+    internal static IReadOnlyList<string>? NormalizeSkills(object? skills)
+    {
+        switch (skills)
+        {
+            case null:
+            case "all":
+                return null;
+            case string s:
+                throw new ArgumentException(
+                    $"ClaudeAgentOptions.Skills must be a list of skill names or \"all\", got \"{s}\". Did you mean [\"{s}\"]?");
+            case IEnumerable<string> names:
+                return names.ToList();
+            default:
+                throw new ArgumentException(
+                    $"ClaudeAgentOptions.Skills must be a list of skill names or \"all\", got {skills.GetType().Name}.");
+        }
     }
 
     /// <summary>
@@ -183,15 +378,17 @@ public class SubprocessTransport : ITransport
         if (_options.Skills == null)
             return (allowedTools, settingSources);
 
-        if (_options.Skills is string s && s == "all")
+        var names = NormalizeSkills(_options.Skills);
+        if (names == null)
         {
             if (!allowedTools.Contains("Skill"))
                 allowedTools.Add("Skill");
         }
-        else if (_options.Skills is IEnumerable<string> names)
+        else
         {
             foreach (var name in names)
             {
+                ValidateSkillName(name);
                 var pattern = $"Skill({name})";
                 if (!allowedTools.Contains(pattern))
                     allowedTools.Add(pattern);
@@ -202,7 +399,7 @@ public class SubprocessTransport : ITransport
         return (allowedTools, settingSources);
     }
 
-    private static string PermissionModeToCliValue(PermissionMode mode) => mode switch
+    internal static string PermissionModeToCliValue(PermissionMode mode) => mode switch
     {
         PermissionMode.Default => "default",
         PermissionMode.AcceptEdits => "acceptEdits",
@@ -298,6 +495,11 @@ public class SubprocessTransport : ITransport
             else
                 cmd.AddRange(["--tools", string.Join(",", _options.Tools)]);
         }
+        else if (_options.ToolsPreset != null)
+        {
+            // Python: the 'claude_code' tools preset maps to `--tools default`.
+            cmd.AddRange(["--tools", "default"]);
+        }
 
         if (_options.AllowedTools.Count > 0)
             cmd.AddRange(["--allowedTools", string.Join(",", _options.AllowedTools)]);
@@ -337,12 +539,23 @@ public class SubprocessTransport : ITransport
         if (_options.ContinueConversation)
             cmd.Add("--continue");
 
-        if (_options.Resume != null)
-            cmd.AddRange(["--resume", _options.Resume]);
+        // Pass these as --flag=value rather than as two argv tokens. The CLI
+        // declares --resume with an optional value, so in the two-token form a
+        // dash-leading value is not bound to the flag and is instead parsed as
+        // a separate CLI flag -- letting an untrusted value inject arbitrary
+        // flags. The equals form always binds the value to the flag. (Python parity.)
+        if (!string.IsNullOrEmpty(_options.Resume))
+        {
+            RejectWindowsCmdMetacharacters("Resume", _options.Resume, OperatingSystem.IsWindows());
+            cmd.Add($"--resume={_options.Resume}");
+        }
 
         // Python commit 5656d20: --session-id forwarding.
         if (!string.IsNullOrEmpty(_options.SessionId))
-            cmd.AddRange(["--session-id", _options.SessionId]);
+        {
+            RejectWindowsCmdMetacharacters("SessionId", _options.SessionId, OperatingSystem.IsWindows());
+            cmd.Add($"--session-id={_options.SessionId}");
+        }
 
         var settingsValue = BuildSettingsValue();
         if (settingsValue != null)
@@ -402,15 +615,8 @@ public class SubprocessTransport : ITransport
         if (_options.SessionStore != null)
             cmd.Add("--session-mirror");
 
-        // Agents are sent via initialize request body, not as a CLI flag
-        // (Python commit 7c6902b — matches TypeScript SDK).
-        // Phase 4B note: the .NET client still emits --agents for back-compat;
-        // tracked in Phase 6B handoff.
-        if (_options.Agents != null && _options.Agents.Count > 0)
-        {
-            var agentsJson = JsonSerializer.Serialize(_options.Agents);
-            cmd.AddRange(["--agents", agentsJson]);
-        }
+        // Agents are sent via the initialize request body, not as a CLI flag
+        // (Python commit 7c6902b — matches TypeScript SDK). See QueryHandler.InitializeAsync.
 
         // Python commit 1c26bd3 + e621929: compute effective allowedTools and
         // setting-sources from skills configuration.
@@ -446,6 +652,11 @@ public class SubprocessTransport : ITransport
         {
             if (value == null)
                 cmd.Add($"--{flag}");
+            else if (value.StartsWith('-'))
+                // In the two-token form a dash-leading value is not bound to its
+                // flag when the CLI declares the option with an optional value --
+                // it parses as a separate flag instead. The equals form always binds.
+                cmd.Add($"--{flag}={value}");
             else
                 cmd.AddRange([$"--{flag}", value]);
         }
@@ -492,37 +703,10 @@ public class SubprocessTransport : ITransport
             cmd.AddRange(["--json-schema", schema.GetRawText()]);
         }
 
-        // Prompt handling - must come after all flags
-        if (_isStreaming)
-        {
-            cmd.AddRange(["--input-format", "stream-json"]);
-        }
-        else
-        {
-            cmd.AddRange(["--print", "--", _prompt.ToString()!]);
-        }
-
-        // Check if command line is too long (Windows limitation) and spill agents JSON to a temp file if needed.
-        var cmdStr = string.Join(" ", cmd);
-        if (cmdStr.Length > CmdLengthLimit && _options.Agents != null && _options.Agents.Count > 0)
-        {
-            try
-            {
-                var agentsIdx = cmd.IndexOf("--agents");
-                if (agentsIdx >= 0 && agentsIdx + 1 < cmd.Count)
-                {
-                    var agentsJsonValue = cmd[agentsIdx + 1];
-                    var tempFile = Path.Combine(Path.GetTempPath(), $"claude-agent-sdk-agents-{Guid.NewGuid():N}.json");
-                    File.WriteAllText(tempFile, agentsJsonValue, Encoding.UTF8);
-                    _tempFiles.Add(tempFile);
-                    cmd[agentsIdx + 1] = $"@{tempFile}";
-                }
-            }
-            catch
-            {
-                // Best-effort only.
-            }
-        }
+        // Always use streaming mode with stdin (matching Python/TypeScript SDKs).
+        // The prompt is written to stdin as a user message, never placed on the
+        // command line, and agents/skills ride in the initialize request.
+        cmd.AddRange(["--input-format", "stream-json"]);
 
         return cmd;
     }
@@ -532,8 +716,22 @@ public class SubprocessTransport : ITransport
         if (_process != null)
             return;
 
+        // Python passes `user=` to process creation (setuid on POSIX). .NET's
+        // Process API can't switch users on Unix, so fail loudly instead of
+        // silently running the CLI with the host's privileges.
+        if (_options.User != null)
+        {
+            throw new NotSupportedException(
+                "ClaudeAgentOptions.User is not supported by the .NET SDK: the CLI would run as the " +
+                "current user. Run the host process as the desired user instead.");
+        }
+
         // Python commit 19e1f53: defer CLI discovery to ConnectAsync.
         _cliPath ??= await Task.Run(FindCli, cancellationToken);
+
+        // Validate the resolved CLI before anything is spawned with it --
+        // this guards the version probe below as well as the main spawn.
+        RejectWindowsBatchCli(_cliPath, OperatingSystem.IsWindows());
 
         // Check CLI version
         if (Environment.GetEnvironmentVariable("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK") == null)
@@ -613,32 +811,38 @@ public class SubprocessTransport : ITransport
             // Python commit f2389ec: track for parent-exit cleanup.
             _activeChildren[_process.Id] = _process;
 
+            // Always streaming (Python parity): stdin stays open for stream-json input.
             _stdin = _process.StandardInput;
             _stdout = _process.StandardOutput;
             if (shouldReadStderr)
             {
                 _stderr = _process.StandardError;
-                _stderrTask = Task.Run(() => HandleStderrAsync(cancellationToken), cancellationToken);
-            }
-
-            // Handle stdin based on mode (string-prompt --print path closes
-            // stdin immediately; streaming path keeps it open for stream-json input)
-            if (!_isStreaming)
-            {
-                _stdin.Close();
-                _stdin = null;
+                // Own token, not the caller's connect token: stderr must keep
+                // draining for the life of the process or the CLI blocks on a
+                // full pipe. Cancelled in CloseAsync.
+                _stderrCts = new CancellationTokenSource();
+                var stderrToken = _stderrCts.Token;
+                _stderrTask = Task.Run(() => HandleStderrAsync(stderrToken), CancellationToken.None);
             }
 
             _ready = true;
         }
-        catch (Exception ex) when (ex is not CliConnectionException)
+        catch (System.ComponentModel.Win32Exception ex)
         {
             if (_cwd != null && !Directory.Exists(_cwd))
             {
-                _exitError = new CliConnectionException($"Working directory does not exist: {_cwd}");
+                _exitError = new CliConnectionException($"Working directory does not exist: {_cwd}", ex);
                 throw _exitError;
             }
-            _exitError = new CliNotFoundException($"Claude Code not found at: {_cliPath}", _cliPath);
+            // ENOENT (2) / ERROR_FILE_NOT_FOUND (2), ERROR_PATH_NOT_FOUND (3)
+            _exitError = ex.NativeErrorCode is 2 or 3
+                ? new CliNotFoundException($"Claude Code not found at: {_cliPath}", _cliPath)
+                : new CliConnectionException($"Failed to start Claude Code: {ex.Message}", ex);
+            throw _exitError;
+        }
+        catch (Exception ex) when (ex is not CliConnectionException)
+        {
+            _exitError = new CliConnectionException($"Failed to start Claude Code: {ex.Message}", ex);
             throw _exitError;
         }
     }
@@ -647,31 +851,54 @@ public class SubprocessTransport : ITransport
     {
         if (_stderr == null) return;
 
-        try
+        void Emit(string line)
         {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                var line = await _stderr.ReadLineAsync(cancellationToken);
-                if (line == null) break;
+            line = line.TrimEnd();
+            if (line.Length == 0)
+                return;
 
-                // Python commit 6bbad5f: isolate per-line so a raise in the user's
-                // callback doesn't terminate the loop and silently drop every
-                // subsequent line for the rest of the session.
-                if (_options.StderrCallback != null)
+            // Python commit 6bbad5f: isolate per-line so a raise in the user's
+            // callback doesn't terminate the loop and silently drop every
+            // subsequent line for the rest of the session.
+            if (_options.StderrCallback != null)
+            {
+                try
                 {
-                    try
-                    {
-                        _options.StderrCallback(line);
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.WriteLine($"[SubprocessTransport] stderr callback threw: {ex.Message}");
-                    }
+                    _options.StderrCallback(line);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"[SubprocessTransport] stderr callback threw: {ex.Message}");
                 }
             }
         }
+
+        // Frame lines out of chunks so a producer that never emits a newline
+        // can't grow the buffer without bound (Python parity).
+        var framer = new LineFramer();
+        var buffer = new char[ReadChunkSize];
+        try
+        {
+            while (true)
+            {
+                var n = await _stderr.ReadAsync(buffer.AsMemory(), cancellationToken);
+                if (n == 0) break;
+                foreach (var line in framer.Push(buffer.AsSpan(0, n)))
+                    Emit(line);
+                if (framer.PendingLength > _maxBufferSize)
+                    Emit(framer.Flush());
+            }
+        }
         catch (OperationCanceledException) { }
-        catch (Exception) { }
+        catch (Exception ex)
+        {
+            Debug.WriteLine($"[SubprocessTransport] stderr stream read failed: {ex.Message}");
+        }
+        finally
+        {
+            // The last partial line is exactly what the caller needs when the CLI stalled.
+            Emit(framer.Flush());
+        }
     }
 
     public async Task WriteAsync(string data, CancellationToken cancellationToken = default)
@@ -710,7 +937,7 @@ public class SubprocessTransport : ITransport
         {
             if (_stdin != null)
             {
-                _stdin.Close();
+                try { _stdin.Close(); } catch { }
                 _stdin = null;
             }
         }
@@ -720,98 +947,113 @@ public class SubprocessTransport : ITransport
         }
     }
 
+    /// <summary>
+    /// Parse one complete line of the CLI's NDJSON stdout. Returns null for lines
+    /// that carry no message (blank lines, non-JSON output such as
+    /// <c>[SandboxDebug] ...</c>). A line that looks like JSON but does not parse
+    /// is corrupt — with proper line framing no later data could complete it — so
+    /// it throws rather than silently dropping (or swallowing later) messages.
+    /// Python: <c>_parse_stdout_line</c>.
+    /// </summary>
+    internal static JsonElement? ParseStdoutLine(string line)
+    {
+        line = line.Trim();
+        if (line.Length == 0)
+            return null;
+        if (!line.StartsWith('{'))
+        {
+            Debug.WriteLine($"[SubprocessTransport] Skipping non-JSON stdout line: {line[..Math.Min(200, line.Length)]}");
+            return null;
+        }
+
+        try
+        {
+            return JsonSerializer.Deserialize<JsonElement>(line);
+        }
+        catch (JsonException ex)
+        {
+            throw new JsonDecodeException(line, ex);
+        }
+    }
+
     public async IAsyncEnumerable<JsonElement> ReadMessagesAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (_process == null || _stdout == null)
             throw new CliConnectionException("Not connected");
 
-        var jsonBuffer = new StringBuilder();
+        // The CLI writes NDJSON: one message per line. Frame lines out of
+        // chunks so a single message is bounded whether complete or not.
+        var framer = new LineFramer();
+        var buffer = new char[ReadChunkSize];
 
-        while (!cancellationToken.IsCancellationRequested)
+        void Guard(int length)
         {
-            string? line;
+            if (length > _maxBufferSize)
+            {
+                throw new JsonDecodeException(
+                    $"JSON message exceeded maximum buffer size of {_maxBufferSize} bytes",
+                    new InvalidOperationException($"Buffer size {length} exceeds limit {_maxBufferSize}")
+                );
+            }
+        }
+
+        while (true)
+        {
+            int n;
             try
             {
-                line = await _stdout.ReadLineAsync(cancellationToken);
+                n = await _stdout.ReadAsync(buffer.AsMemory(), cancellationToken);
             }
             catch (OperationCanceledException)
             {
+                // Consumer disconnected: don't fall through to the exit-code
+                // check (the process is still running).
+                yield break;
+            }
+
+            if (n == 0)
                 break;
-            }
 
-            if (line == null)
-                break;
-
-            var lineStr = line.Trim();
-            if (string.IsNullOrEmpty(lineStr))
-                continue;
-
-            // Python commit c290bbf: skip non-JSON lines (e.g. [SandboxDebug])
-            // when not mid-parse — they corrupt the buffer otherwise.
-            if (jsonBuffer.Length == 0 && !lineStr.StartsWith('{'))
+            foreach (var line in framer.Push(buffer.AsSpan(0, n)))
             {
-                Debug.WriteLine($"[SubprocessTransport] Skipping non-JSON stdout line: {lineStr.Substring(0, Math.Min(200, lineStr.Length))}");
-                continue;
+                Guard(line.Length);
+                var data = ParseStdoutLine(line);
+                if (data.HasValue)
+                    yield return data.Value;
             }
-
-            jsonBuffer.Append(lineStr);
-
-            if (jsonBuffer.Length > _maxBufferSize)
-            {
-                var bufferLength = jsonBuffer.Length;
-                jsonBuffer.Clear();
-                throw new JsonDecodeException(
-                    $"JSON message exceeded maximum buffer size of {_maxBufferSize} bytes",
-                    new InvalidOperationException($"Buffer size {bufferLength} exceeds limit {_maxBufferSize}")
-                );
-            }
-
-            JsonElement json;
-            try
-            {
-                json = JsonSerializer.Deserialize<JsonElement>(jsonBuffer.ToString());
-            }
-            catch (JsonException)
-            {
-                // Speculatively decode until we have a full JSON object.
-                continue;
-            }
-
-            jsonBuffer.Clear();
-            yield return json;
+            Guard(framer.PendingLength);
         }
 
-        // Flush any remaining buffered JSON at EOF.
-        if (jsonBuffer.Length > 0)
+        // Flush whatever is left. A residual tail means either a producer that
+        // omits the final newline (yield it) or one cut off mid-write (drop it).
+        var tail = framer.Flush();
+        JsonElement? trailing = null;
+        try
         {
-            var trailing = default(JsonElement);
-            var hasTrailing = false;
-            try
-            {
-                trailing = JsonSerializer.Deserialize<JsonElement>(jsonBuffer.ToString());
-                hasTrailing = true;
-            }
-            catch (JsonException)
-            {
-                // Ignore incomplete trailing JSON.
-            }
-
-            if (hasTrailing)
-                yield return trailing;
+            trailing = ParseStdoutLine(tail);
         }
+        catch (JsonDecodeException)
+        {
+            Debug.WriteLine($"[SubprocessTransport] Dropping truncated JSON at end of CLI stdout: {tail[..Math.Min(200, tail.Length)]}");
+        }
+        if (trailing.HasValue)
+            yield return trailing.Value;
 
         // Check process exit
         try
         {
             await _process.WaitForExitAsync(cancellationToken);
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            yield break;
+        }
 
         if (_process.ExitCode != 0)
         {
             _exitError = new ProcessException(
-                "Command failed",
+                $"Command failed with exit code {_process.ExitCode}",
                 _process.ExitCode,
                 "Check stderr output for details"
             );
@@ -821,6 +1063,7 @@ public class SubprocessTransport : ITransport
 
     private async Task CheckClaudeVersionAsync(CancellationToken cancellationToken)
     {
+        Process? process = null;
         try
         {
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -829,14 +1072,14 @@ public class SubprocessTransport : ITransport
             var startInfo = new ProcessStartInfo
             {
                 FileName = _cliPath,
-                Arguments = "-v",
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
+            startInfo.ArgumentList.Add("-v");
 
-            using var process = Process.Start(startInfo);
+            process = Process.Start(startInfo);
             if (process == null) return;
 
             var output = await process.StandardOutput.ReadToEndAsync(cts.Token);
@@ -866,32 +1109,66 @@ public class SubprocessTransport : ITransport
         {
             // Ignore version check failures
         }
+        finally
+        {
+            if (process != null)
+            {
+                // Don't leave a hung probe behind after the timeout (Python parity).
+                try { if (!process.HasExited) process.Kill(); } catch { }
+                process.Dispose();
+            }
+        }
+    }
+
+    [System.Runtime.InteropServices.DllImport("libc", EntryPoint = "kill", SetLastError = true)]
+    private static extern int SysKill(int pid, int sig);
+
+    private const int SIGTERM = 15;
+
+    /// <summary>
+    /// SIGTERM on POSIX so the CLI can clean up its own children and flush its
+    /// session file; TerminateProcess on Windows (Python's terminate()).
+    /// </summary>
+    private static void Terminate(Process process)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            process.Kill();
+            return;
+        }
+        try
+        {
+            SysKill(process.Id, SIGTERM);
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            process.Kill();
+        }
     }
 
     public async Task CloseAsync()
     {
-        // Clean up temp files
-        foreach (var tempFile in _tempFiles)
-        {
-            try { File.Delete(tempFile); } catch { }
-        }
-        _tempFiles.Clear();
-
         if (_process == null)
         {
             _ready = false;
             return;
         }
 
-        // Wait for stderr task
+        // Stop the stderr reader (it flushes its last partial line on the way out).
         if (_stderrTask != null)
         {
+            try { _stderrCts?.Cancel(); } catch { }
             try { await _stderrTask.WaitAsync(TimeSpan.FromSeconds(1)); }
             catch { }
+            _stderrTask = null;
         }
+        _stderrCts?.Dispose();
+        _stderrCts = null;
 
-        // Close stdin
-        await _writeLock.WaitAsync();
+        // Close stdin (hold the write lock to prevent a race with concurrent
+        // writes). Bounded: a writer blocked on a full stdin pipe must not pin
+        // close forever (Python parity: 5s).
+        var lockHeld = await _writeLock.WaitAsync(TimeSpan.FromSeconds(5));
         try
         {
             _ready = false;
@@ -903,11 +1180,14 @@ public class SubprocessTransport : ITransport
         }
         finally
         {
-            _writeLock.Release();
+            if (lockHeld)
+                _writeLock.Release();
         }
 
-        // Python commit 40cc6f5: wait for graceful shutdown after stdin EOF;
-        // SIGTERM only if it doesn't exit, force kill if SIGTERM doesn't take.
+        // Python commit 40cc6f5: wait for graceful shutdown after stdin EOF
+        // (the CLI flushes its session file then), SIGTERM if it doesn't exit,
+        // force kill if SIGTERM doesn't take.
+        var exited = false;
         try
         {
             if (!_process.HasExited)
@@ -919,27 +1199,42 @@ public class SubprocessTransport : ITransport
                 }
                 catch (OperationCanceledException)
                 {
-                    // Force terminate (SIGTERM equivalent on POSIX; TerminateProcess on Win32).
-                    try { _process.Kill(); } catch { }
+                    try { Terminate(_process); } catch { }
                     try
                     {
-                        using var killCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                        await _process.WaitForExitAsync(killCts.Token);
+                        using var termCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        await _process.WaitForExitAsync(termCts.Token);
                     }
                     catch (OperationCanceledException)
                     {
                         try { _process.Kill(entireProcessTree: true); } catch { }
-                        try { await _process.WaitForExitAsync(); } catch { }
+                        try
+                        {
+                            using var killCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                            await _process.WaitForExitAsync(killCts.Token);
+                        }
+                        catch { }
                     }
                 }
             }
+            exited = _process.HasExited;
+        }
+        catch
+        {
+            exited = false;
         }
         finally
         {
-            _activeChildren.TryRemove(_process.Id, out _);
+            // Only stop tracking a child we actually reaped. A still-running
+            // process stays in the set (undisposed) so the parent-exit reaper
+            // gets a chance at it.
+            if (exited)
+            {
+                _activeChildren.TryRemove(_process.Id, out _);
+                _process.Dispose();
+            }
         }
 
-        _process.Dispose();
         _process = null;
         _stdout = null;
         _stderr = null;

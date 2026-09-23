@@ -1330,8 +1330,21 @@ public record ThinkingConfigDisabled : IThinkingConfig
 /// <summary>
 /// Query options for Claude SDK.
 /// </summary>
-public class ClaudeAgentOptions
+/// <remarks>
+/// A record so the SDK can derive adjusted copies with <c>with</c> (Python's
+/// <c>dataclasses.replace</c>). <see cref="ToString"/> deliberately omits
+/// members such as <see cref="Env"/> that commonly carry secrets.
+/// </remarks>
+public record ClaudeAgentOptions
 {
+    /// <summary>Prints only non-sensitive members.</summary>
+    protected virtual bool PrintMembers(System.Text.StringBuilder builder)
+    {
+        builder.Append("Model = ").Append(Model).Append(", Cwd = ").Append(Cwd)
+            .Append(", PermissionMode = ").Append(PermissionMode);
+        return true;
+    }
+
     /// <summary>Base set of tools to enable.</summary>
     public IReadOnlyList<string>? Tools { get; init; }
 
