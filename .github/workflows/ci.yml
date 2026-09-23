@@ -49,10 +49,31 @@ jobs:
         name: unit-test-results-${{ matrix.os }}
         path: ./test-results
 
+  aot:
+    name: NativeAOT smoke test
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
+
+    # Publishing fails on any trim/AOT warning (TreatWarningsAsErrors in the
+    # smoke project); the native binary then exercises the AOT-safe surface.
+    - name: Publish NativeAOT smoke app
+      run: dotnet publish tests/Claude.AgentSdk.AotSmoke -c Release -r linux-x64 -o ./aot
+
+    - name: Run NativeAOT smoke app
+      run: ./aot/Claude.AgentSdk.AotSmoke
+
   package:
     name: Package
     runs-on: ubuntu-latest
-    needs: build
+    needs: [build, aot]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     steps:
