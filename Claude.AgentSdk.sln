@@ -55,6 +55,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ContextUsage", "examples\ex
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HookEvents", "examples\extensions\HookEvents\HookEvents.csproj", "{F0F09C30-D961-405C-BD0E-C433D12F037D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Claude.AgentSdk.IntegrationTests", "tests\Claude.AgentSdk.IntegrationTests\Claude.AgentSdk.IntegrationTests.csproj", "{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -317,6 +319,18 @@ Global
 		{F0F09C30-D961-405C-BD0E-C433D12F037D}.Release|x64.Build.0 = Release|Any CPU
 		{F0F09C30-D961-405C-BD0E-C433D12F037D}.Release|x86.ActiveCfg = Release|Any CPU
 		{F0F09C30-D961-405C-BD0E-C433D12F037D}.Release|x86.Build.0 = Release|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Debug|x64.Build.0 = Debug|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Debug|x86.Build.0 = Debug|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x64.ActiveCfg = Release|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x64.Build.0 = Release|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x86.ActiveCfg = Release|Any CPU
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -345,5 +359,6 @@ Global
 		{6A7FEE4B-EF85-4BAA-B216-7ECF43C50355} = {09499393-0251-FC88-284D-312889A601B1}
 		{7C834417-8A1B-41C1-B75D-7C36FFE1DFCB} = {09499393-0251-FC88-284D-312889A601B1}
 		{F0F09C30-D961-405C-BD0E-C433D12F037D} = {09499393-0251-FC88-284D-312889A601B1}
+		{5B8AD5D7-45AF-44C3-9341-674ACDC7FAE8} = {C4D5E6F7-A8B9-0123-4567-890ABCDEF012}
 	EndGlobalSection
 EndGlobal
