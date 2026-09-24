@@ -258,6 +258,28 @@ try
         parsed += count;
     }
     Check(parsed > 50, $"parsed {parsed} recorded CLI messages from {fixtureDir}");
+
+    // ---- Convenience surface: QueryTextAsync, QueryAsync<T>, [McpTool], public ScriptedTransport,
+    // StreamJsonReader -----------------------------------------------------------------------------
+    var smokeTools = new SmokeTools();
+    var scripted = new Claude.AgentSdk.Testing.ScriptedTransport()
+        .Turn(t => t.McpToolCall("attr", "mul", """{"x":6,"y":7}""").Result("42"));
+    var attrOptions = new ClaudeAgentOptions
+    {
+        McpServers = McpServers.Sdk("attr", b => b.ToolsFrom(smokeTools, SmokeJsonContext.Default))
+    };
+    Check(await Sdk.QueryTextAsync("multiply", attrOptions, scripted) == "42" && smokeTools.Calls == 1,
+        "QueryTextAsync + [McpTool] ToolsFrom(context) + public ScriptedTransport");
+
+    var structured = new Claude.AgentSdk.Testing.ScriptedTransport()
+        .Turn(t => t.Result(structuredOutputJson: """{"x":3,"y":4}"""));
+    var typed = await Sdk.QueryAsync("structured", SmokeJsonContext.Default.MulArgs, transport: structured);
+    Check(typed == new MulArgs(3, 4), "QueryAsync<T>(JsonTypeInfo<T>) structured output");
+
+    var lines = new List<string>();
+    await foreach (var m in StreamJsonReader.ReadAsync(new StringReader("noise\n{\"type\":\"a\"}\n")))
+        lines.Add(m.GetProperty("type").GetString()!);
+    Check(lines is ["a"], "StreamJsonReader parses stream-json");
 }
 catch (Exception ex)
 {
@@ -287,6 +309,18 @@ static async IAsyncEnumerable<Dictionary<string, object?>> PromptStream()
 namespace Claude.AgentSdk.AotSmoke
 {
     public sealed record MulArgs(int X, int Y);
+
+    public sealed class SmokeTools
+    {
+        public int Calls;
+
+        [McpTool("mul", ReadOnly = true)]
+        public string Mul(MulArgs args)
+        {
+            Calls++;
+            return (args.X * args.Y).ToString();
+        }
+    }
 
     [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
     [JsonSerializable(typeof(MulArgs))]

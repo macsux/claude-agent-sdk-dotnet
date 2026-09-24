@@ -8,6 +8,8 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Claude.AgentSdk.Internal;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Claude.AgentSdk.Transport;
 
@@ -57,6 +59,7 @@ public class SubprocessTransport : ITransport
     private string? _cliPath; // Python commit 19e1f53: deferred CLI discovery to ConnectAsync.
     private readonly string? _cwd;
     private readonly int _maxBufferSize;
+    private readonly ILogger _logger;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
 
     private Process? _process;
@@ -86,6 +89,7 @@ public class SubprocessTransport : ITransport
         _cliPath = options.CliPath;
         _cwd = options.Cwd;
         _maxBufferSize = options.MaxBufferSize ?? DefaultMaxBufferSize;
+        _logger = options.Logger ?? NullLogger.Instance;
     }
 
     private static string FindCli()
@@ -833,6 +837,15 @@ public class SubprocessTransport : ITransport
             // Python commit f2389ec: track for parent-exit cleanup.
             _activeChildren[_process.Id] = _process;
 
+            if (_logger.IsEnabled(LogLevel.Debug))
+            {
+                // Flag names only: values can carry prompts, settings JSON and MCP secrets.
+                var flags = cmd.Skip(1).Where(a => a.StartsWith("--", StringComparison.Ordinal))
+                    .Select(a => a.Split('=', 2)[0]);
+                _logger.LogDebug("Started Claude Code CLI {CliPath} (pid {Pid}) with flags {Flags}",
+                    _cliPath, _process.Id, string.Join(" ", flags));
+            }
+
             // Always streaming (Python parity): stdin stays open for stream-json input.
             _stdin = _process.StandardInput;
             _stdout = _process.StandardOutput;
@@ -890,9 +903,10 @@ public class SubprocessTransport : ITransport
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"[SubprocessTransport] stderr callback threw: {ex.Message}");
+                    _logger.LogWarning(ex, "StderrCallback threw; continuing");
                 }
             }
+            _logger.LogTrace("CLI stderr: {Line}", line);
         }
 
         // Frame lines out of chunks so a producer that never emits a newline
@@ -914,7 +928,7 @@ public class SubprocessTransport : ITransport
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            Debug.WriteLine($"[SubprocessTransport] stderr stream read failed: {ex.Message}");
+            _logger.LogDebug(ex, "CLI stderr stream read failed");
         }
         finally
         {
@@ -977,26 +991,7 @@ public class SubprocessTransport : ITransport
     /// it throws rather than silently dropping (or swallowing later) messages.
     /// Python: <c>_parse_stdout_line</c>.
     /// </summary>
-    internal static JsonElement? ParseStdoutLine(string line)
-    {
-        line = line.Trim();
-        if (line.Length == 0)
-            return null;
-        if (!line.StartsWith('{'))
-        {
-            Debug.WriteLine($"[SubprocessTransport] Skipping non-JSON stdout line: {line[..Math.Min(200, line.Length)]}");
-            return null;
-        }
-
-        try
-        {
-            return JsonSerializer.Deserialize(line, SdkJsonContext.Default.JsonElement);
-        }
-        catch (JsonException ex)
-        {
-            throw new JsonDecodeException(line, ex);
-        }
-    }
+    internal static JsonElement? ParseStdoutLine(string line) => StreamJsonReader.ParseLine(line);
 
     public async IAsyncEnumerable<JsonElement> ReadMessagesAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -1004,63 +999,38 @@ public class SubprocessTransport : ITransport
         if (_process == null || _stdout == null)
             throw new CliConnectionException("Not connected");
 
-        // The CLI writes NDJSON: one message per line. Frame lines out of
-        // chunks so a single message is bounded whether complete or not.
-        var framer = new LineFramer();
-        var buffer = new char[ReadChunkSize];
-
-        void Guard(int length)
-        {
-            if (length > _maxBufferSize)
-            {
-                throw new JsonDecodeException(
-                    $"JSON message exceeded maximum buffer size of {_maxBufferSize} bytes",
-                    new InvalidOperationException($"Buffer size {length} exceeds limit {_maxBufferSize}")
-                );
-            }
-        }
-
-        while (true)
-        {
-            int n;
-            try
-            {
-                n = await _stdout.ReadAsync(buffer.AsMemory(), cancellationToken);
-            }
-            catch (OperationCanceledException)
-            {
-                // Consumer disconnected: don't fall through to the exit-code
-                // check (the process is still running).
-                yield break;
-            }
-
-            if (n == 0)
-                break;
-
-            foreach (var line in framer.Push(buffer.AsSpan(0, n)))
-            {
-                Guard(line.Length);
-                var data = ParseStdoutLine(line);
-                if (data.HasValue)
-                    yield return data.Value;
-            }
-            Guard(framer.PendingLength);
-        }
-
-        // Flush whatever is left. A residual tail means either a producer that
-        // omits the final newline (yield it) or one cut off mid-write (drop it).
-        var tail = framer.Flush();
-        JsonElement? trailing = null;
+        // The CLI writes NDJSON: one message per line, bounded while being received.
+        var messages = StreamJsonReader.ReadAsync(_stdout, _maxBufferSize, _logger, cancellationToken)
+            .GetAsyncEnumerator(cancellationToken);
+        var cancelled = false;
         try
         {
-            trailing = ParseStdoutLine(tail);
+            while (true)
+            {
+                bool hasNext;
+                try
+                {
+                    hasNext = await messages.MoveNextAsync();
+                }
+                catch (OperationCanceledException)
+                {
+                    // Consumer disconnected: don't fall through to the exit-code
+                    // check (the process is still running).
+                    hasNext = false;
+                    cancelled = true;
+                }
+                if (!hasNext)
+                    break;
+                yield return messages.Current;
+            }
         }
-        catch (JsonDecodeException)
+        finally
         {
-            Debug.WriteLine($"[SubprocessTransport] Dropping truncated JSON at end of CLI stdout: {tail[..Math.Min(200, tail.Length)]}");
+            await messages.DisposeAsync();
         }
-        if (trailing.HasValue)
-            yield return trailing.Value;
+
+        if (cancelled)
+            yield break;
 
         // Check process exit
         try
@@ -1072,6 +1042,7 @@ public class SubprocessTransport : ITransport
             yield break;
         }
 
+        _logger.LogDebug("Claude Code CLI exited with code {ExitCode}", _process.ExitCode);
         if (_process.ExitCode != 0)
         {
             _exitError = new ProcessException(
@@ -1081,6 +1052,18 @@ public class SubprocessTransport : ITransport
             );
             throw _exitError;
         }
+    }
+
+    /// <summary>
+    /// User-facing warning: to the configured logger, or stderr when none is set
+    /// (Python logs via logger.warning, which reaches stderr by default).
+    /// </summary>
+    private void WarnUser(string message)
+    {
+        if (_options.Logger != null)
+            _logger.LogWarning("{Warning}", message);
+        else
+            Console.Error.WriteLine($"Warning: {message}");
     }
 
     private async Task CheckClaudeVersionAsync(CancellationToken cancellationToken)
@@ -1118,8 +1101,8 @@ public class SubprocessTransport : ITransport
                     // Python commit 6384c69: dedupe the warning per process.
                     if (Interlocked.Exchange(ref _versionWarningEmitted, 1) == 0)
                     {
-                        Console.Error.WriteLine(
-                            $"Warning: Claude Code version {version} is unsupported in the Agent SDK. " +
+                        WarnUser(
+                            $"Claude Code version {version} is unsupported in the Agent SDK. " +
                             $"Minimum required version is {MinimumClaudeCodeVersion}. " +
                             "Some features may not work correctly."
                         );
@@ -1129,7 +1112,7 @@ public class SubprocessTransport : ITransport
                 var verbatimWarning = GetVerbatimPromptsVersionWarning(
                     _options.VerbatimPrompts, match.Groups[1].Value, _cliPath);
                 if (verbatimWarning != null)
-                    Console.Error.WriteLine($"Warning: {verbatimWarning}");
+                    WarnUser(verbatimWarning);
             }
         }
         catch (Exception)

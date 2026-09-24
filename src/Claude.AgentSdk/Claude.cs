@@ -12,7 +12,7 @@ namespace Claude.AgentSdk;
 /// <summary>
 /// Main entry point for Claude Agent SDK.
 /// </summary>
-public static class Claude
+public static partial class Claude
 {
     /// <summary>
     /// Create a new options builder.

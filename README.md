@@ -10,17 +10,18 @@ A modern .NET library for interacting with the Claude Code CLI, providing both a
 
 ## Features
 
-- Simple `Claude.QueryAsync()` API for one-shot requests
+- Simple `Claude.QueryAsync()` API for one-shot requests, plus `QueryTextAsync` and typed `QueryAsync<T>`
 - `ClaudeSDKClient` for multi-turn, bidirectional conversations
 - Control protocol support (interrupts, modes, dynamic model switching)
 - Hook system (PreToolUse, PostToolUse, UserPromptSubmit)
 - Tool permission callbacks with allow/deny control
-- In-process MCP server support (tools, prompts, resources)
+- In-process MCP server support (tools, prompts, resources), including `[McpTool]` attribute classes
+- `ILogger` integration and a `ScriptedTransport` for unit-testing agent code without the CLI
 - Cross-platform: Windows, Linux, macOS
-- Source-generated JSON models for message types
-- Well-tested: 109 tests (90 unit + 19 integration; integration tests are disabled by default)
+- Trim- and NativeAOT-compatible (source-generated JSON throughout)
+- Tested against the real Claude Code CLI (opt-in integration suite) and recorded CLI traffic
 
-> **Parity:** This release tracks Python `claude-agent-sdk` v0.2.82. See [CHANGELOG.md](CHANGELOG.md) for details.
+> **Parity:** Tracks Python `claude-agent-sdk` v0.2.158. See [docs/PARITY.md](docs/PARITY.md).
 
 ## Prerequisites
 
@@ -116,6 +117,27 @@ var options = Claude.Options()
     .Build();
 ```
 
+### One-Call Helpers
+
+```csharp
+// Final answer as text (throws ResultException on max-turns/budget/API errors)
+string answer = await Claude.QueryTextAsync("What is 17 * 3?");
+
+// Typed structured output; the JSON schema comes from source-generated metadata
+Forecast f = await Claude.QueryAsync("Forecast for Lisbon tomorrow", MyJson.Default.Forecast);
+
+[JsonSerializable(typeof(Forecast))]
+partial class MyJson : JsonSerializerContext;
+```
+
+`Claude.QueryAsync<Forecast>(prompt)` (no `JsonTypeInfo`) also works, using reflection (not AOT-safe).
+
+### Logging
+
+Set `ClaudeAgentOptions.Logger` (or `.Logger(...)` on the builder) to any `ILogger`. The SDK logs CLI
+discovery/spawn (flag names only), exit codes, control-protocol traffic (subtypes and ids), callback
+failures and warnings. Prompts, argument values, environment and message contents are never logged.
+
 ### MCP Tools (In-Process)
 
 ```csharp
@@ -128,6 +150,37 @@ var options = Claude.Options()
     .AllowAllTools()
     .Build();
 ```
+
+Or mark methods with `[McpTool]` and register a whole class. Passing a `JsonSerializerContext` keeps it
+trim/NativeAOT-safe (one arguments record per tool); without one, any parameter list works via reflection.
+
+```csharp
+public sealed class InventoryTools
+{
+    [McpTool("stock_level", Description = "Units in stock for a SKU", ReadOnly = true)]
+    public string StockLevel(StockArgs args) => ...;
+}
+
+var servers = McpServers.Sdk("inventory", b => b.ToolsFrom(new InventoryTools(), MyJson.Default));
+```
+
+### Testing Your Agent Code
+
+`Claude.AgentSdk.Testing.ScriptedTransport` plays the CLI's side of a conversation without the CLI:
+deterministic, instant, free. Permission prompts, hook callbacks and MCP tool calls pause the script
+until your code answers, so your callbacks run exactly as they would live.
+
+```csharp
+var cli = new ScriptedTransport().Turn(t => t
+    .PermissionRequest("Write", """{"file_path":"/etc/hosts","content":"x"}""")
+    .Result("I can't write there."));
+
+await Claude.QueryTextAsync("update /etc/hosts", myOptions, cli);
+Assert.Equal("deny", cli.PermissionResponses[0].GetProperty("behavior").GetString());
+```
+
+Custom transports (e.g. a CLI over SSH or in a container) can reuse `StreamJsonReader` for the
+bounded, forward-compatible stream-json parsing that `SubprocessTransport` uses.
 
 ### Trimming and NativeAOT
 
@@ -238,23 +291,24 @@ See the `examples/` directory:
 | `ToolPermissionCallback` | Permission control |
 | `Agents` | Agent configurations |
 | `MaxBudget` | Spending limits |
+| `Convenience` | `QueryTextAsync`, typed `QueryAsync<T>`, `[McpTool]` classes, `ILogger` |
+| `TestingYourAgent` | Unit-testing agent code with `ScriptedTransport` |
 
 ## Status & Parity
 
 - **Current version:** 0.1.0
 - **Status:** Preview (API and behavior may change)
 - **Parity:** Designed to match the Python Claude Agent SDK API, behavior, and ergonomics
-- **Tests:** 109 tests (90 unit + 19 integration; integration tests are disabled by default)
-
-### Known Limitations
-
-- `control_cancel_request` is currently ignored (cancellation of in-flight control requests is not implemented yet; matches Python SDK TODO).
+- **Tests:** unit tests (including replays of recorded real-CLI traffic), a live-CLI integration
+  suite, and a NativeAOT smoke app. See [docs/TESTING.md](docs/TESTING.md).
+- **Parity inventory:** [docs/PARITY.md](docs/PARITY.md)
 
 ### Running Integration Tests
 
-Integration tests require a working Claude Code CLI and are disabled by default.
+Integration tests talk to the real Claude Code CLI (latency, non-determinism, real cost — about
+$0.25 per full run on Haiku) and are skipped unless enabled:
 
-- Enable them with: `CLAUDE_AGENT_SDK_RUN_INTEGRATION_TESTS=1 dotnet test`
+- `CLAUDE_AGENT_SDK_RUN_INTEGRATION_TESTS=1 dotnet test tests/Claude.AgentSdk.IntegrationTests`
 
 **Canonical rule:** The Python `claude-agent-sdk` is the canonical reference. This .NET port tracks its behavior and API.
 

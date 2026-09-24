@@ -4,6 +4,8 @@
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Claude.AgentSdk.Mcp;
 using Claude.AgentSdk.Sessions;
 using Claude.AgentSdk.Transport;
@@ -62,6 +64,8 @@ internal class QueryHandler : IAsyncDisposable
     private static readonly HashSet<string> DeferringTaskTypes = ["local_agent", "local_workflow"];
     private static readonly HashSet<string> TerminalTaskStatuses = ["completed", "failed", "stopped", "killed"];
 
+    private readonly ILogger _logger;
+
     public QueryHandler(
         ITransport transport,
         ClaudeAgentOptions options,
@@ -69,6 +73,7 @@ internal class QueryHandler : IAsyncDisposable
     {
         _transport = transport;
         _options = options;
+        _logger = options.Logger ?? NullLogger.Instance;
         _initializeTimeout = initializeTimeout ?? TimeSpan.FromSeconds(60);
         _messageChannel = Channel.CreateBounded<JsonElement>(new BoundedChannelOptions(100)
         {
@@ -107,7 +112,7 @@ internal class QueryHandler : IAsyncDisposable
             ["session_id"] = key?.SessionId ?? ""
         };
         if (!_messageChannel.Writer.TryWrite(SdkJson.SerializeToElement(msg)))
-            System.Diagnostics.Debug.WriteLine($"[QueryHandler] Dropping mirror_error message (buffer full): {error}");
+            _logger.LogWarning("Dropping mirror_error message (message buffer full): {Error}", error);
     }
 
     /// <summary>
@@ -273,6 +278,7 @@ internal class QueryHandler : IAsyncDisposable
                         : null;
                     if (cancelId != null)
                     {
+                        _logger.LogDebug("CLI cancelled control request {RequestId}", cancelId);
                         await _lock.WaitAsync(CancellationToken.None);
                         try
                         {
@@ -523,6 +529,7 @@ internal class QueryHandler : IAsyncDisposable
 
         var requestId = requestIdElement.GetString()!;
         var subtype = request.GetProperty("subtype").GetString();
+        _logger.LogDebug("Control request {Subtype} ({RequestId}) from CLI", subtype, requestId);
 
         try
         {
@@ -569,6 +576,9 @@ internal class QueryHandler : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            // Callback failures fail closed: the CLI gets an error response.
+            _logger.LogWarning(ex, "Control request {Subtype} ({RequestId}) failed; replying with an error", subtype, requestId);
+
             // Send error response
             var errorResponse = new Dictionary<string, object?>
             {
@@ -588,7 +598,7 @@ internal class QueryHandler : IAsyncDisposable
             catch (Exception writeEx)
             {
                 // Fire-and-forget task: don't leave an unobserved exception behind.
-                System.Diagnostics.Debug.WriteLine($"[QueryHandler] Failed to write control error response: {writeEx.Message}");
+                _logger.LogWarning(writeEx, "Failed to write control error response for {Subtype} request {RequestId}", subtype, requestId);
             }
         }
     }
@@ -802,6 +812,7 @@ internal class QueryHandler : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var requestId = $"req_{Interlocked.Increment(ref _requestCounter)}_{Guid.NewGuid():N}";
+        _logger.LogDebug("Sending control request {Subtype} ({RequestId})", request.GetValueOrDefault("subtype"), requestId);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         await _lock.WaitAsync(cancellationToken);
@@ -1016,7 +1027,7 @@ internal class QueryHandler : IAsyncDisposable
             // A user-supplied prompt stream (or the write) failed. Don't leave
             // stdin open — the CLI would wait for input forever — fall through
             // and close it like a normal end of input (Python parity).
-            System.Diagnostics.Debug.WriteLine($"[QueryHandler] Prompt stream failed; closing stdin: {ex.Message}");
+            _logger.LogError(ex, "Prompt stream failed; closing stdin");
         }
 
         try
@@ -1029,7 +1040,7 @@ internal class QueryHandler : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            System.Diagnostics.Debug.WriteLine($"[QueryHandler] Error closing input stream: {ex.Message}");
+            _logger.LogDebug(ex, "Error closing input stream");
         }
     }
 

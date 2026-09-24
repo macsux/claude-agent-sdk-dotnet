@@ -97,7 +97,12 @@ internal static class CanUseToolConfiguration
         // Advisory only (no throw): shadowing can be intentional.
         var warning = GetShadowedWarning(options);
         if (warning != null && EmittedWarnings.TryAdd(warning, 0))
-            WarningSink(warning);
+        {
+            if (options.Logger != null)
+                Microsoft.Extensions.Logging.LoggerExtensions.LogWarning(options.Logger, "{Warning}", warning);
+            else
+                WarningSink(warning);
+        }
 
         return options with { PermissionPromptToolName = "stdio" };
     }

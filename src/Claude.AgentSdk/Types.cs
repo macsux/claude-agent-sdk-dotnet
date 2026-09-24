@@ -1727,6 +1727,17 @@ public record ClaudeAgentOptions
     public SessionStoreFlushMode SessionStoreFlush { get; init; } = SessionStoreFlushMode.Batched;
 
     /// <summary>
+    /// Optional logger for SDK diagnostics: CLI discovery and spawn, process exit,
+    /// skipped/dropped stdout lines, control-protocol traffic (subtypes and ids only),
+    /// callback failures, and warnings. Argument values, prompts, environment and
+    /// message contents are never logged, since they can carry secrets. When a
+    /// logger is set, CLI stderr lines are also logged at Trace (only if stderr is
+    /// being read, i.e. <see cref="StderrCallback"/> or debug-to-stderr is set).
+    /// Not part of Python's options; .NET addition.
+    /// </summary>
+    public Microsoft.Extensions.Logging.ILogger? Logger { get; init; }
+
+    /// <summary>
     /// Timeout, in milliseconds, for each <see cref="ISessionStore"/> load /
     /// list call during resume materialization. The query fails with a clear
     /// error instead of hanging when the adapter doesn't settle in time. 0 (or

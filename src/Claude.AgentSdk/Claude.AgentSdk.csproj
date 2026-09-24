@@ -51,4 +51,9 @@
     <None Include="../../README.md" Pack="true" PackagePath="/"/>
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- ILogger integration (ClaudeAgentOptions.Logger). Abstractions only: trim/AOT-safe, no providers. -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+  </ItemGroup>
+
 </Project>

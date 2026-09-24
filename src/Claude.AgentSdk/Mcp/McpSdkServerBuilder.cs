@@ -28,7 +28,7 @@ namespace Claude.AgentSdk.Mcp;
 /// and binding are inferred by reflection. Convenient, but not trim/AOT-compatible.</description></item>
 /// </list>
 /// </remarks>
-public sealed class McpSdkServerBuilder
+public sealed partial class McpSdkServerBuilder
 {
     internal const string DelegateToolRequiresMessage =
         "Tool(string, Delegate, ...) infers the input schema and binds arguments by reflecting over the delegate's " +
@@ -323,21 +323,26 @@ public sealed class McpSdkServerBuilder
             Converters = { new JsonStringEnumConverter() }
         };
 
-        private readonly Delegate _handler;
+        private readonly MethodInfo _method;
+        private readonly object? _target;
         private readonly BindingPlan _bindingPlan;
 
-        private DelegateToolRegistration(string name, string? description, JsonElement inputSchema, Delegate handler, BindingPlan bindingPlan, McpToolAnnotations? annotations)
+        private DelegateToolRegistration(string name, string? description, JsonElement inputSchema, MethodInfo method, object? target, BindingPlan bindingPlan, McpToolAnnotations? annotations)
             : base(name, description, inputSchema, annotations)
         {
-            _handler = handler;
+            _method = method;
+            _target = target;
             _bindingPlan = bindingPlan;
         }
 
         public static DelegateToolRegistration Create(string name, string? description, Delegate handler, McpToolAnnotations? annotations = null)
+            => Create(name, description, handler.Method, handler.Target, annotations);
+
+        public static DelegateToolRegistration Create(string name, string? description, MethodInfo method, object? target, McpToolAnnotations? annotations = null)
         {
-            var plan = BindingPlan.Create(handler.Method);
+            var plan = BindingPlan.Create(method);
             var schema = plan.BuildInputSchema();
-            return new DelegateToolRegistration(name, description, schema, handler, plan, annotations);
+            return new DelegateToolRegistration(name, description, schema, method, target, plan, annotations);
         }
 
         public override async Task<McpToolResult> InvokeAsync(JsonElement args, CancellationToken ct)
@@ -346,7 +351,7 @@ public sealed class McpSdkServerBuilder
             object? result;
             try
             {
-                result = _handler.DynamicInvoke(invokeArgs);
+                result = _method.Invoke(_target, invokeArgs);
             }
             catch (TargetInvocationException tie) when (tie.InnerException != null)
             {

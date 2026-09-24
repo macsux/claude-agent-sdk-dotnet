@@ -42,6 +42,7 @@ public sealed class ClaudeAgentOptionsBuilder
     private readonly Dictionary<string, string?> _extraArgs = [];
     private int? _maxBufferSize;
     private Action<string>? _stderrCallback;
+    private Microsoft.Extensions.Logging.ILogger? _logger;
     private CanUseToolCallback? _canUseTool;
     private IReadOnlyDictionary<HookEvent, IReadOnlyList<HookMatcher>>? _hooks;
     private string? _user;
@@ -350,6 +351,13 @@ public sealed class ClaudeAgentOptionsBuilder
         return this;
     }
 
+    /// <summary>Set the logger for SDK diagnostics (see <see cref="ClaudeAgentOptions.Logger"/>).</summary>
+    public ClaudeAgentOptionsBuilder Logger(Microsoft.Extensions.Logging.ILogger logger)
+    {
+        _logger = logger;
+        return this;
+    }
+
     /// <summary>Set the user identifier.</summary>
     public ClaudeAgentOptionsBuilder User(string user)
     {
@@ -628,6 +636,7 @@ public sealed class ClaudeAgentOptionsBuilder
             ExtraArgs = _extraArgs.Count > 0 ? _extraArgs : new Dictionary<string, string?>(),
             MaxBufferSize = _maxBufferSize,
             StderrCallback = _stderrCallback,
+            Logger = _logger,
             CanUseTool = _canUseTool,
             Hooks = _hooks,
             User = _user,
