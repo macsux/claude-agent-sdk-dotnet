@@ -130,7 +130,7 @@ public class MessageParserTests
 
         var message = MessageParser.Parse(json);
 
-        Assert.IsType<SystemMessage>(message);
+        Assert.IsType<SystemInitMessage>(message);
         var systemMessage = (SystemMessage)message;
         Assert.Equal("init", systemMessage.Subtype);
     }
@@ -148,13 +148,22 @@ public class MessageParserTests
     }
 
     [Fact]
-    public void Parse_ThrowsOnUnknownType()
+    public void Parse_UnknownType_ReturnsUnknownMessage()
     {
         var json = JsonSerializer.Deserialize<JsonElement>("""
         {
             "type": "unknown_type"
         }
         """);
+
+        // TS parity: unknown types pass through (Python drops them).
+        Assert.Equal("unknown_type", Assert.IsType<UnknownMessage>(MessageParser.Parse(json)).Type);
+    }
+
+    [Fact]
+    public void Parse_ThrowsOnInternalKeepAlive()
+    {
+        var json = JsonSerializer.Deserialize<JsonElement>("""{"type": "keep_alive"}""");
 
         Assert.Throws<MessageParseException>(() => MessageParser.Parse(json));
     }

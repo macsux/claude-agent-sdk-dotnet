@@ -19,7 +19,7 @@ public class QueryTests(ITestOutputHelper output) : IntegrationTestBase(output)
             options, Transport(options), Ct));
 
         // Stream shape: init first, result last, at least one assistant message in between.
-        var init = Assert.IsType<SystemMessage>(messages[0]);
+        var init = Assert.IsType<SystemInitMessage>(messages[0]);
         Assert.Equal("init", init.Subtype);
         Assert.IsType<ResultMessage>(messages[^1]);
 

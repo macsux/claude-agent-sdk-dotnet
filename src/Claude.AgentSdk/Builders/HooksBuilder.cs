@@ -113,6 +113,24 @@ public sealed class HooksBuilder
         return this;
     }
 
+    /// <summary>
+    /// Add a hook for an event by its CLI name (e.g. <c>"SessionEnd"</c>).
+    /// Works for events this SDK version doesn't list yet: unknown names are
+    /// registered via <see cref="HookEventNames.Parse"/> and sent verbatim.
+    /// </summary>
+    public HooksBuilder On(string eventName, string? matcher, HookCallback callback, double? timeout = null)
+    {
+        AddHook(HookEventNames.Parse(eventName), matcher, callback, timeout);
+        return this;
+    }
+
+    /// <summary>Add a hook with multiple callbacks for any event.</summary>
+    public HooksBuilder On(HookEvent hookEvent, string? matcher, params HookCallback[] callbacks)
+    {
+        AddHook(hookEvent, matcher, callbacks);
+        return this;
+    }
+
     private void AddHook(HookEvent hookEvent, string? matcher, HookCallback callback, double? timeout = null)
     {
         if (!_hooks.TryGetValue(hookEvent, out var list))

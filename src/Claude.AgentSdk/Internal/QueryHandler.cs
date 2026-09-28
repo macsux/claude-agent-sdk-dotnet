@@ -130,7 +130,8 @@ internal class QueryHandler : IAsyncDisposable
         {
             foreach (var (hookEvent, matchers) in _options.Hooks)
             {
-                var eventName = hookEvent.ToString();
+                // Wire name (also resolves events registered via HookEventNames.Parse).
+                var eventName = hookEvent.ToJsonString();
                 hooksConfig[eventName] = [];
 
                 foreach (var matcher in matchers)
@@ -697,6 +698,8 @@ internal class QueryHandler : IAsyncDisposable
             result["systemMessage"] = output.SystemMessage;
         if (output.Reason != null)
             result["reason"] = output.Reason;
+        if (output.TerminalSequence != null)
+            result["terminalSequence"] = output.TerminalSequence;
         if (output.HookSpecificOutput.HasValue)
             result["hookSpecificOutput"] = WithoutNullMembers(output.HookSpecificOutput.Value);
         if (output.Async.HasValue)
@@ -1045,7 +1048,9 @@ internal class QueryHandler : IAsyncDisposable
     }
 
     /// <summary>
-    /// Receive SDK messages (not control messages).
+    /// Receive SDK messages (not control messages). Unrecognized top-level
+    /// types are yielded as <see cref="UnknownMessage"/> (TS behaviour; Python
+    /// drops them); only internal frames such as <c>keep_alive</c> are skipped.
     /// </summary>
     public async IAsyncEnumerable<Message> ReceiveMessagesAsync(
         [EnumeratorCancellation] CancellationToken cancellationToken = default)

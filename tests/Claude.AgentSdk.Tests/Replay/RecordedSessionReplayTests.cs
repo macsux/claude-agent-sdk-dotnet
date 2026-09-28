@@ -64,7 +64,7 @@ public class RecordedSessionReplayTests
         Assert.True(transport.InputEnded);
 
         // CLI → SDK: init, rate limit, assistant (thinking + text), result.
-        var init = Assert.IsType<SystemMessage>(messages[0]);
+        var init = Assert.IsType<SystemInitMessage>(messages[0]);
         Assert.Equal("init", init.Subtype);
         var sessionId = init.Data.GetProperty("session_id").GetString();
         var rate = Assert.Single(messages.OfType<RateLimitEvent>());

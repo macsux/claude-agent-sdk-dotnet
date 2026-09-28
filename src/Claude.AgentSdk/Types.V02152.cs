@@ -89,6 +89,34 @@ public record TaskUpdatedMessage : SystemMessage
 
     [JsonPropertyName("uuid")]
     public string? Uuid { get; init; }
+
+    /// <summary>Typed view of <see cref="Patch"/> (TS <c>SDKTaskUpdatedMessage.patch</c>).</summary>
+    [JsonIgnore]
+    public TaskUpdatedPatch? TypedPatch { get; init; }
+}
+
+/// <summary>Typed <c>task_updated</c> patch. Every member is optional: only changed fields are sent.</summary>
+public record TaskUpdatedPatch
+{
+    /// <summary><c>pending</c>, <c>running</c>, <c>completed</c>, <c>failed</c>, <c>killed</c> or <c>paused</c>.</summary>
+    [JsonPropertyName("status")]
+    public string? Status { get; init; }
+
+    [JsonPropertyName("description")]
+    public string? Description { get; init; }
+
+    /// <summary>End time, epoch milliseconds.</summary>
+    [JsonPropertyName("end_time")]
+    public double? EndTime { get; init; }
+
+    [JsonPropertyName("total_paused_ms")]
+    public double? TotalPausedMs { get; init; }
+
+    [JsonPropertyName("error")]
+    public string? Error { get; init; }
+
+    [JsonPropertyName("is_backgrounded")]
+    public bool? IsBackgrounded { get; init; }
 }
 
 #endregion
@@ -243,6 +271,14 @@ public record ModelUsage
     /// </summary>
     [JsonPropertyName("provider")]
     public string? Provider { get; init; }
+
+    /// <summary>Thinking tokens, when reported. TS 0.3.283.</summary>
+    [JsonPropertyName("thinkingTokens")]
+    public int? ThinkingTokens { get; init; }
+
+    /// <summary><c>list</c>, <c>managed</c> or <c>unknown</c>. TS 0.3.283.</summary>
+    [JsonPropertyName("costBasis")]
+    public string? CostBasis { get; init; }
 }
 
 #endregion
@@ -273,6 +309,18 @@ public record ConversationResetMessage : Message
     /// <summary>The outgoing session; messages after the reset carry a new id.</summary>
     [JsonPropertyName("session_id")]
     public required string SessionId { get; init; }
+
+    /// <summary><c>clear</c>, <c>plan_mode_exit</c>, <c>fresh_session</c> or <c>onboarding</c>. TS 0.3.283.</summary>
+    [JsonPropertyName("trigger")]
+    public string? Trigger { get; init; }
+
+    /// <summary>UUID of the user message that caused the reset. TS 0.3.283.</summary>
+    [JsonPropertyName("user_message_uuid")]
+    public string? UserMessageUuid { get; init; }
+
+    /// <summary>ISO-8601 timestamp. TS 0.3.283.</summary>
+    [JsonPropertyName("timestamp")]
+    public string? Timestamp { get; init; }
 }
 
 #endregion

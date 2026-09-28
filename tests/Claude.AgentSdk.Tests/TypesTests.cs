@@ -140,7 +140,7 @@ public class TypesTests
     public void HookEvent_HasAllExpectedValues()
     {
         var values = Enum.GetValues<HookEvent>();
-        Assert.Equal(10, values.Length);
+        Assert.Equal(33, values.Length); // TS 0.3.283 HOOK_EVENTS
 
         Assert.Contains(HookEvent.PostToolUseFailure, values);
         Assert.Contains(HookEvent.Notification, values);

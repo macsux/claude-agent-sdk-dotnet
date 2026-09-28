@@ -24,8 +24,16 @@ public enum PermissionMode
 }
 
 /// <summary>
-/// Hook event types.
+/// Hook event types. Covers every event in the TypeScript SDK's
+/// <c>HOOK_EVENTS</c> (0.3.283). The first ten members keep their original
+/// numeric values; newer events are appended.
 /// </summary>
+/// <remarks>
+/// For an event this SDK version doesn't list yet, use
+/// <see cref="HookEventNames.Parse"/> (or <c>HooksBuilder.On(string, ...)</c>):
+/// it returns a <see cref="HookEvent"/> value outside the named range that is
+/// sent to the CLI under the exact name you passed.
+/// </remarks>
 public enum HookEvent
 {
     PreToolUse,
@@ -37,7 +45,53 @@ public enum HookEvent
     PreCompact,
     Notification,
     SubagentStart,
-    PermissionRequest
+    PermissionRequest,
+    /// <summary>After a batch of parallel tool calls completes. TS 0.3.283.</summary>
+    PostToolBatch,
+    /// <summary>When a slash command or MCP prompt expands into a prompt. TS 0.3.283.</summary>
+    UserPromptExpansion,
+    /// <summary>Session start (startup, resume, clear, compact, fork). TS 0.3.283.</summary>
+    SessionStart,
+    /// <summary>Session end. TS 0.3.283.</summary>
+    SessionEnd,
+    /// <summary>Turn ended with an API error. TS 0.3.283.</summary>
+    StopFailure,
+    /// <summary>After compaction. TS 0.3.283.</summary>
+    PostCompact,
+    /// <summary>Before the model is switched. TS 0.3.283.</summary>
+    PreModelSwitch,
+    /// <summary>After the model is switched. TS 0.3.283.</summary>
+    PostModelSwitch,
+    /// <summary>A tool call was denied by the permission system. TS 0.3.283.</summary>
+    PermissionDenied,
+    /// <summary>Repository setup (init / maintenance). TS 0.3.283.</summary>
+    Setup,
+    /// <summary>A teammate went idle. TS 0.3.283.</summary>
+    TeammateIdle,
+    /// <summary>A team task was created. TS 0.3.283.</summary>
+    TaskCreated,
+    /// <summary>A team task was completed. TS 0.3.283.</summary>
+    TaskCompleted,
+    /// <summary>An MCP server requested user input (elicitation). TS 0.3.283.</summary>
+    Elicitation,
+    /// <summary>The user answered an MCP elicitation. TS 0.3.283.</summary>
+    ElicitationResult,
+    /// <summary>A settings file or skills changed. TS 0.3.283.</summary>
+    ConfigChange,
+    /// <summary>A worktree should be created (hook returns its path). TS 0.3.283.</summary>
+    WorktreeCreate,
+    /// <summary>A worktree was removed. TS 0.3.283.</summary>
+    WorktreeRemove,
+    /// <summary>A CLAUDE.md / memory file was loaded. TS 0.3.283.</summary>
+    InstructionsLoaded,
+    /// <summary>The working directory changed. TS 0.3.283.</summary>
+    CwdChanged,
+    /// <summary>A watched file changed. TS 0.3.283.</summary>
+    FileChanged,
+    /// <summary>A directory was added to the session. TS 0.3.283.</summary>
+    DirectoryAdded,
+    /// <summary>Assistant text is about to be displayed. TS 0.3.283.</summary>
+    MessageDisplay
 }
 
 /// <summary>
@@ -81,7 +135,9 @@ public enum PermissionUpdateDestination
     UserSettings,
     ProjectSettings,
     LocalSettings,
-    Session
+    Session,
+    /// <summary>Rule came from a CLI argument (e.g. <c>--allowedTools</c>). TS 0.3.283.</summary>
+    CliArg
 }
 
 /// <summary>
@@ -98,8 +154,14 @@ public enum PermissionUpdateType
 }
 
 /// <summary>
-/// Assistant message error types.
+/// Assistant message error types (TS <c>SDKAssistantMessageError</c>).
 /// </summary>
+/// <remarks>
+/// <see cref="Unknown"/> covers both the CLI's literal <c>"unknown"</c> and any
+/// value this SDK version doesn't recognize; the exact wire string is kept on
+/// <see cref="AssistantMessage.ErrorRaw"/>. Values after <see cref="Unknown"/>
+/// were appended for TS 0.3.283 parity, so existing numeric values are stable.
+/// </remarks>
 public enum AssistantMessageError
 {
     AuthenticationFailed,
@@ -107,7 +169,14 @@ public enum AssistantMessageError
     RateLimit,
     InvalidRequest,
     ServerError,
-    Unknown
+    Unknown,
+    OauthOrgNotAllowed,
+    AccountOnHold,
+    VerificationRequired,
+    Overloaded,
+    ModelNotFound,
+    MaxOutputTokens,
+    CloudCredentialError
 }
 
 /// <summary>
@@ -148,6 +217,7 @@ internal static class EnumHelpers
         PermissionUpdateDestination.ProjectSettings => "projectSettings",
         PermissionUpdateDestination.LocalSettings => "localSettings",
         PermissionUpdateDestination.Session => "session",
+        PermissionUpdateDestination.CliArg => "cliArg",
         _ => dest.ToString()
     };
 
@@ -172,20 +242,7 @@ internal static class EnumHelpers
         _ => effort.ToString().ToLowerInvariant()
     };
 
-    public static string ToJsonString(this HookEvent hookEvent) => hookEvent switch
-    {
-        HookEvent.PreToolUse => "PreToolUse",
-        HookEvent.PostToolUse => "PostToolUse",
-        HookEvent.PostToolUseFailure => "PostToolUseFailure",
-        HookEvent.UserPromptSubmit => "UserPromptSubmit",
-        HookEvent.Stop => "Stop",
-        HookEvent.SubagentStop => "SubagentStop",
-        HookEvent.PreCompact => "PreCompact",
-        HookEvent.Notification => "Notification",
-        HookEvent.SubagentStart => "SubagentStart",
-        HookEvent.PermissionRequest => "PermissionRequest",
-        _ => hookEvent.ToString()
-    };
+    public static string ToJsonString(this HookEvent hookEvent) => HookEventNames.ToWireName(hookEvent);
 }
 
 #endregion
@@ -198,6 +255,7 @@ internal static class EnumHelpers
 [JsonPolymorphic(TypeDiscriminatorPropertyName = "type")]
 [JsonDerivedType(typeof(TextBlock), "text")]
 [JsonDerivedType(typeof(ThinkingBlock), "thinking")]
+[JsonDerivedType(typeof(RedactedThinkingBlock), "redacted_thinking")]
 [JsonDerivedType(typeof(ToolUseBlock), "tool_use")]
 [JsonDerivedType(typeof(ToolResultBlock), "tool_result")]
 [JsonDerivedType(typeof(ServerToolUseBlock), "server_tool_use")]
@@ -272,7 +330,19 @@ public record ServerToolUseBlock(
 public record ServerToolResultBlock(
     [property: JsonPropertyName("tool_use_id")] string ToolUseId,
     [property: JsonPropertyName("content")] JsonElement Content
-) : ContentBlock;
+) : ContentBlock
+{
+    /// <summary>
+    /// The wire block type this result was parsed from, e.g.
+    /// <c>advisor_tool_result</c>, <c>web_search_tool_result</c>,
+    /// <c>web_fetch_tool_result</c>, <c>code_execution_tool_result</c>,
+    /// <c>bash_code_execution_tool_result</c>,
+    /// <c>text_editor_code_execution_tool_result</c> or
+    /// <c>tool_search_tool_result</c>. <c>null</c> when constructed directly.
+    /// </summary>
+    [JsonIgnore]
+    public string? ResultType { get; init; }
+}
 
 #endregion
 
@@ -287,7 +357,17 @@ public record ServerToolResultBlock(
 [JsonDerivedType(typeof(SystemMessage), "system")]
 [JsonDerivedType(typeof(ResultMessage), "result")]
 [JsonDerivedType(typeof(StreamEvent), "stream_event")]
-public abstract record Message;
+public abstract record Message
+{
+    /// <summary>
+    /// The complete, unmodified JSON frame this message was parsed from (TS
+    /// SDK parity: every <c>SDKMessage</c> is the raw object). Use it to read
+    /// fields this SDK version doesn't model. <c>default</c>
+    /// (<see cref="JsonValueKind.Undefined"/>) for messages constructed in code.
+    /// </summary>
+    [JsonIgnore]
+    public JsonElement Raw { get; init; }
+}
 
 /// <summary>
 /// User message.
@@ -316,6 +396,57 @@ public record UserMessage : Message
     /// </summary>
     [JsonPropertyName("origin")]
     public MessageOrigin? Origin { get; init; }
+
+    /// <summary>Session this message belongs to. TS <c>SDKUserMessage.session_id</c>.</summary>
+    [JsonPropertyName("session_id")]
+    public string? SessionId { get; init; }
+
+    /// <summary>True for messages the CLI synthesized (not typed by a user). TS <c>isSynthetic</c>.</summary>
+    [JsonPropertyName("isSynthetic")]
+    public bool? IsSynthetic { get; init; }
+
+    /// <summary>
+    /// True when this is a replay of an earlier user message (TS
+    /// <c>SDKUserMessageReplay</c>, e.g. on resume) rather than a live frame.
+    /// </summary>
+    [JsonPropertyName("isReplay")]
+    public bool? IsReplay { get; init; }
+
+    /// <summary>Queue priority: <c>"now"</c>, <c>"next"</c> or <c>"later"</c>. TS <c>priority</c>.</summary>
+    [JsonPropertyName("priority")]
+    public string? Priority { get; init; }
+
+    /// <summary>ISO-8601 timestamp. TS <c>timestamp</c>.</summary>
+    [JsonPropertyName("timestamp")]
+    public string? Timestamp { get; init; }
+
+    /// <summary>Whether this message should trigger a model query. TS <c>shouldQuery</c>.</summary>
+    [JsonPropertyName("shouldQuery")]
+    public bool? ShouldQuery { get; init; }
+
+    /// <summary>True when the prompt was delivered verbatim (no @-mention / slash expansion). TS <c>client_composed</c>.</summary>
+    [JsonPropertyName("client_composed")]
+    public bool? ClientComposed { get; init; }
+
+    /// <summary>File attachments on a replayed message, raw. TS <c>SDKUserMessageReplay.file_attachments</c>.</summary>
+    [JsonPropertyName("file_attachments")]
+    public JsonElement? FileAttachments { get; init; }
+
+    /// <summary>Pasted content blocks, raw. TS <c>pasted_content</c>.</summary>
+    [JsonPropertyName("pasted_content")]
+    public JsonElement? PastedContent { get; init; }
+
+    /// <summary>Inline paste references. TS <c>inline_pastes</c>.</summary>
+    [JsonPropertyName("inline_pastes")]
+    public IReadOnlyList<string>? InlinePastes { get; init; }
+
+    /// <summary>Sub-agent type, when the message belongs to a sub-agent. TS <c>subagent_type</c>.</summary>
+    [JsonPropertyName("subagent_type")]
+    public string? SubagentType { get; init; }
+
+    /// <summary>Sub-agent task description. TS <c>task_description</c>.</summary>
+    [JsonPropertyName("task_description")]
+    public string? TaskDescription { get; init; }
 
     /// <summary>
     /// Gets the content as a string if it's a simple text message.
@@ -376,6 +507,66 @@ public record AssistantMessage : Message
     /// <summary>Unique ID for this message. Python commit 24b9b68.</summary>
     [JsonPropertyName("uuid")]
     public string? Uuid { get; init; }
+
+    /// <summary>
+    /// The exact <c>error</c> string from the wire, preserved even when
+    /// <see cref="Error"/> is <see cref="AssistantMessageError.Unknown"/>.
+    /// TS <c>SDKAssistantMessageError</c>.
+    /// </summary>
+    [JsonPropertyName("error_raw")]
+    public string? ErrorRaw { get; init; }
+
+    /// <summary>API request id. TS <c>request_id</c>.</summary>
+    [JsonPropertyName("request_id")]
+    public string? RequestId { get; init; }
+
+    /// <summary>UUID of the user message this reply answers. TS <c>user_message_uuid</c>.</summary>
+    [JsonPropertyName("user_message_uuid")]
+    public string? UserMessageUuid { get; init; }
+
+    /// <summary>UUIDs of the user messages this reply answers (batched turns). TS <c>user_message_uuids</c>.</summary>
+    [JsonPropertyName("user_message_uuids")]
+    public IReadOnlyList<string>? UserMessageUuids { get; init; }
+
+    /// <summary>Why a turn was resumed. TS <c>resume_reason</c>.</summary>
+    [JsonPropertyName("resume_reason")]
+    public string? ResumeReason { get; init; }
+
+    /// <summary>True when resumed from incomplete thinking. TS <c>resumed_from_incomplete_thinking</c>.</summary>
+    [JsonPropertyName("resumed_from_incomplete_thinking")]
+    public bool? ResumedFromIncompleteThinking { get; init; }
+
+    /// <summary>UUIDs of earlier assistant messages this one replaces. TS <c>supersedes</c>.</summary>
+    [JsonPropertyName("supersedes")]
+    public IReadOnlyList<string>? Supersedes { get; init; }
+
+    /// <summary>True when the message was cut short by an abort. TS <c>aborted</c>.</summary>
+    [JsonPropertyName("aborted")]
+    public bool? Aborted { get; init; }
+
+    /// <summary>Sub-agent type, when produced by a sub-agent. TS <c>subagent_type</c>.</summary>
+    [JsonPropertyName("subagent_type")]
+    public string? SubagentType { get; init; }
+
+    /// <summary>Sub-agent task description. TS <c>task_description</c>.</summary>
+    [JsonPropertyName("task_description")]
+    public string? TaskDescription { get; init; }
+
+    /// <summary>ISO-8601 timestamp. TS <c>timestamp</c>.</summary>
+    [JsonPropertyName("timestamp")]
+    public string? Timestamp { get; init; }
+
+    /// <summary>Context-window usage snapshot after this message. TS <c>context_usage</c>.</summary>
+    [JsonPropertyName("context_usage")]
+    public SdkContextUsage? ContextUsage { get; init; }
+
+    /// <summary>Session cost / rate-limit report. TS <c>usage_report</c>.</summary>
+    [JsonPropertyName("usage_report")]
+    public SdkUsageReport? UsageReport { get; init; }
+
+    /// <summary>Stop sequence that ended generation, if any (inner <c>message.stop_sequence</c>).</summary>
+    [JsonPropertyName("stop_sequence")]
+    public string? StopSequence { get; init; }
 }
 
 /// <summary>
@@ -471,6 +662,58 @@ public record ResultMessage : Message
     /// </summary>
     [JsonPropertyName("origin")]
     public MessageOrigin? Origin { get; init; }
+
+    /// <summary>Typed view of <see cref="PermissionDenials"/> (TS <c>SDKPermissionDenial[]</c>); empty when absent.</summary>
+    public IReadOnlyList<PermissionDenial> GetPermissionDenials() =>
+        Internal.TsParsing.ParsePermissionDenials(PermissionDenials);
+
+    /// <summary>Turns still queued behind this one. TS <c>queued_turn_count</c>.</summary>
+    [JsonPropertyName("queued_turn_count")]
+    public int? QueuedTurnCount { get; init; }
+
+    /// <summary>Index of this result within a batched turn. TS <c>result_index</c>.</summary>
+    [JsonPropertyName("result_index")]
+    public int? ResultIndex { get; init; }
+
+    /// <summary>Fast-mode state; see <see cref="FastModeStates"/>. TS <c>fast_mode_state</c>.</summary>
+    [JsonPropertyName("fast_mode_state")]
+    public string? FastModeState { get; init; }
+
+    /// <summary>Why fast mode is off; see <see cref="FastModeDisabledReasons"/>. TS <c>fast_mode_disabled_reason</c>.</summary>
+    [JsonPropertyName("fast_mode_disabled_reason")]
+    public string? FastModeDisabledReason { get; init; }
+
+    /// <summary>Why the session failed to start; see <see cref="StartupFailureReasons"/>. TS <c>startup_failure_reason</c>.</summary>
+    [JsonPropertyName("startup_failure_reason")]
+    public string? StartupFailureReason { get; init; }
+
+    /// <summary>UUID of the user message that triggered this turn. TS <c>user_message_uuid</c>.</summary>
+    [JsonPropertyName("user_message_uuid")]
+    public string? UserMessageUuid { get; init; }
+
+    /// <summary>UUIDs of the user messages this turn answered. TS <c>user_message_uuids</c>.</summary>
+    [JsonPropertyName("user_message_uuids")]
+    public IReadOnlyList<string>? UserMessageUuids { get; init; }
+
+    /// <summary>Why the turn was resumed. TS <c>resume_reason</c>.</summary>
+    [JsonPropertyName("resume_reason")]
+    public string? ResumeReason { get; init; }
+
+    /// <summary>Local slash command that produced this result. TS <c>local_command</c>.</summary>
+    [JsonPropertyName("local_command")]
+    public string? LocalCommand { get; init; }
+
+    /// <summary>Time to first token, in ms. TS <c>ttft_ms</c>.</summary>
+    [JsonPropertyName("ttft_ms")]
+    public double? TtftMs { get; init; }
+
+    /// <summary>Time to first streamed token, in ms. TS <c>ttft_stream_ms</c>.</summary>
+    [JsonPropertyName("ttft_stream_ms")]
+    public double? TtftStreamMs { get; init; }
+
+    /// <summary>Time until the API request was sent, in ms. TS <c>time_to_request_ms</c>.</summary>
+    [JsonPropertyName("time_to_request_ms")]
+    public double? TimeToRequestMs { get; init; }
 }
 
 /// <summary>
@@ -499,6 +742,22 @@ public record StreamEvent : Message
 
     [JsonPropertyName("parent_tool_use_id")]
     public string? ParentToolUseId { get; init; }
+
+    /// <summary>Time to first token, in ms. TS <c>ttft_ms</c>.</summary>
+    [JsonPropertyName("ttft_ms")]
+    public double? TtftMs { get; init; }
+
+    /// <summary>UUID of the user message being answered. TS <c>user_message_uuid</c>.</summary>
+    [JsonPropertyName("user_message_uuid")]
+    public string? UserMessageUuid { get; init; }
+
+    /// <summary>UUIDs of the user messages being answered. TS <c>user_message_uuids</c>.</summary>
+    [JsonPropertyName("user_message_uuids")]
+    public IReadOnlyList<string>? UserMessageUuids { get; init; }
+
+    /// <summary>Why the turn was resumed. TS <c>resume_reason</c>.</summary>
+    [JsonPropertyName("resume_reason")]
+    public string? ResumeReason { get; init; }
 }
 
 #endregion
@@ -595,6 +854,7 @@ public record PermissionUpdate(
                 "projectSettings" => PermissionUpdateDestination.ProjectSettings,
                 "localSettings" => PermissionUpdateDestination.LocalSettings,
                 "session" => PermissionUpdateDestination.Session,
+                "cliArg" => PermissionUpdateDestination.CliArg,
                 _ => null
             });
     }
@@ -737,6 +997,7 @@ public record PermissionUpdate(
                 "projectSettings" => PermissionUpdateDestination.ProjectSettings,
                 "localSettings" => PermissionUpdateDestination.LocalSettings,
                 "session" => PermissionUpdateDestination.Session,
+                "cliArg" => PermissionUpdateDestination.CliArg,
                 _ => null
             };
         }
@@ -818,6 +1079,32 @@ public record BaseHookInput
 
     [JsonPropertyName("permission_mode")]
     public string? PermissionMode { get; init; }
+
+    /// <summary>Identifier of the prompt that triggered this hook. TS <c>BaseHookInput.prompt_id</c>.</summary>
+    [JsonPropertyName("prompt_id")]
+    public string? PromptId { get; init; }
+
+    /// <summary>
+    /// Sub-agent identifier when this hook fires inside a Task-spawned
+    /// sub-agent. Python commit 2f1fd38 (tool hooks); on every hook in TS 0.3.283.
+    /// </summary>
+    [JsonPropertyName("agent_id")]
+    public string? AgentId { get; init; }
+
+    /// <summary>Agent type name (e.g. "general-purpose"). Python commit 2f1fd38; TS <c>BaseHookInput.agent_type</c>.</summary>
+    [JsonPropertyName("agent_type")]
+    public string? AgentType { get; init; }
+
+    /// <summary>Effort level in force for this turn. TS <c>BaseHookInput.effort</c>.</summary>
+    [JsonPropertyName("effort")]
+    public HookEffort? Effort { get; init; }
+
+    /// <summary>
+    /// The full hook input as received from the CLI, set by
+    /// <see cref="HookInput.Parse"/>. <c>default</c> when constructed in code.
+    /// </summary>
+    [JsonIgnore]
+    public JsonElement Raw { get; init; }
 }
 
 /// <summary>
@@ -837,13 +1124,9 @@ public record PreToolUseHookInput : BaseHookInput
     [JsonPropertyName("tool_use_id")]
     public required string ToolUseId { get; init; }
 
-    /// <summary>Sub-agent identifier when this hook fires inside a Task-spawned sub-agent. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_id")]
-    public string? AgentId { get; init; }
-
-    /// <summary>Agent type name (e.g. "general-purpose", "code-reviewer"). Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_type")]
-    public string? AgentType { get; init; }
+    /// <summary>MCP server that provides the tool, for MCP tools. TS <c>mcp_server</c>.</summary>
+    [JsonPropertyName("mcp_server")]
+    public McpServerProvenance? McpServer { get; init; }
 }
 
 /// <summary>
@@ -866,13 +1149,13 @@ public record PostToolUseHookInput : BaseHookInput
     [JsonPropertyName("tool_use_id")]
     public required string ToolUseId { get; init; }
 
-    /// <summary>Sub-agent identifier. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_id")]
-    public string? AgentId { get; init; }
+    /// <summary>Tool execution time in milliseconds. TS <c>duration_ms</c>.</summary>
+    [JsonPropertyName("duration_ms")]
+    public double? DurationMs { get; init; }
 
-    /// <summary>Agent type name. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_type")]
-    public string? AgentType { get; init; }
+    /// <summary>MCP server that provides the tool, for MCP tools. TS <c>mcp_server</c>.</summary>
+    [JsonPropertyName("mcp_server")]
+    public McpServerProvenance? McpServer { get; init; }
 }
 
 /// <summary>
@@ -898,13 +1181,13 @@ public record PostToolUseFailureHookInput : BaseHookInput
     [JsonPropertyName("is_interrupt")]
     public bool? IsInterrupt { get; init; }
 
-    /// <summary>Sub-agent identifier. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_id")]
-    public string? AgentId { get; init; }
+    /// <summary>Tool execution time in milliseconds. TS <c>duration_ms</c>.</summary>
+    [JsonPropertyName("duration_ms")]
+    public double? DurationMs { get; init; }
 
-    /// <summary>Agent type name. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_type")]
-    public string? AgentType { get; init; }
+    /// <summary>MCP server that provides the tool, for MCP tools. TS <c>mcp_server</c>.</summary>
+    [JsonPropertyName("mcp_server")]
+    public McpServerProvenance? McpServer { get; init; }
 }
 
 /// <summary>
@@ -917,6 +1200,17 @@ public record UserPromptSubmitHookInput : BaseHookInput
 
     [JsonPropertyName("prompt")]
     public required string Prompt { get; init; }
+
+    /// <summary>
+    /// Where the prompt came from: <c>user</c>, <c>sdk</c>, <c>system</c>,
+    /// <c>loop_wakeup</c>, <c>schedule_wakeup</c>, <c>poll_event</c>. TS <c>source</c>.
+    /// </summary>
+    [JsonPropertyName("source")]
+    public string? Source { get; init; }
+
+    /// <summary>Current session title. TS <c>session_title</c>.</summary>
+    [JsonPropertyName("session_title")]
+    public string? SessionTitle { get; init; }
 }
 
 /// <summary>
@@ -929,6 +1223,18 @@ public record StopHookInput : BaseHookInput
 
     [JsonPropertyName("stop_hook_active")]
     public required bool StopHookActive { get; init; }
+
+    /// <summary>Text of the last assistant message. TS <c>last_assistant_message</c>.</summary>
+    [JsonPropertyName("last_assistant_message")]
+    public string? LastAssistantMessage { get; init; }
+
+    /// <summary>Background tasks still running. TS <c>background_tasks</c>.</summary>
+    [JsonPropertyName("background_tasks")]
+    public IReadOnlyList<BackgroundTaskSummary>? BackgroundTasks { get; init; }
+
+    /// <summary>Session cron jobs. TS <c>session_crons</c>.</summary>
+    [JsonPropertyName("session_crons")]
+    public IReadOnlyList<SessionCronSummary>? SessionCrons { get; init; }
 }
 
 /// <summary>
@@ -943,13 +1249,25 @@ public record SubagentStopHookInput : BaseHookInput
     public required bool StopHookActive { get; init; }
 
     [JsonPropertyName("agent_id")]
-    public required string AgentId { get; init; }
+    public new required string AgentId { get; init; }
 
     [JsonPropertyName("agent_transcript_path")]
     public required string AgentTranscriptPath { get; init; }
 
     [JsonPropertyName("agent_type")]
-    public required string AgentType { get; init; }
+    public new required string AgentType { get; init; }
+
+    /// <summary>Text of the last assistant message. TS <c>last_assistant_message</c>.</summary>
+    [JsonPropertyName("last_assistant_message")]
+    public string? LastAssistantMessage { get; init; }
+
+    /// <summary>Background tasks still running. TS <c>background_tasks</c>.</summary>
+    [JsonPropertyName("background_tasks")]
+    public IReadOnlyList<BackgroundTaskSummary>? BackgroundTasks { get; init; }
+
+    /// <summary>Session cron jobs. TS <c>session_crons</c>.</summary>
+    [JsonPropertyName("session_crons")]
+    public IReadOnlyList<SessionCronSummary>? SessionCrons { get; init; }
 }
 
 /// <summary>
@@ -994,10 +1312,10 @@ public record SubagentStartHookInput : BaseHookInput
     public string HookEventName => "SubagentStart";
 
     [JsonPropertyName("agent_id")]
-    public required string AgentId { get; init; }
+    public new required string AgentId { get; init; }
 
     [JsonPropertyName("agent_type")]
-    public required string AgentType { get; init; }
+    public new required string AgentType { get; init; }
 }
 
 /// <summary>
@@ -1017,13 +1335,16 @@ public record PermissionRequestHookInput : BaseHookInput
     [JsonPropertyName("permission_suggestions")]
     public JsonElement? PermissionSuggestions { get; init; }
 
-    /// <summary>Sub-agent identifier. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_id")]
-    public string? AgentId { get; init; }
+    /// <summary>
+    /// Typed view of <see cref="PermissionSuggestions"/> (TS <c>PermissionUpdate[]</c>).
+    /// Set by <see cref="HookInput.Parse"/>; unknown update types are skipped.
+    /// </summary>
+    [JsonIgnore]
+    public IReadOnlyList<PermissionUpdate>? Suggestions { get; init; }
 
-    /// <summary>Agent type name. Python commit 2f1fd38.</summary>
-    [JsonPropertyName("agent_type")]
-    public string? AgentType { get; init; }
+    /// <summary>MCP server that provides the tool, for MCP tools. TS <c>mcp_server</c>.</summary>
+    [JsonPropertyName("mcp_server")]
+    public McpServerProvenance? McpServer { get; init; }
 }
 
 /// <summary>
@@ -1040,6 +1361,7 @@ public record HookOutput
     [JsonPropertyName("stopReason")]
     public string? StopReason { get; init; }
 
+    /// <summary>Top-level decision: <see cref="HookDecision.Approve"/> or <see cref="HookDecision.Block"/>.</summary>
     [JsonPropertyName("decision")]
     public string? Decision { get; init; }
 
@@ -1048,6 +1370,13 @@ public record HookOutput
 
     [JsonPropertyName("reason")]
     public string? Reason { get; init; }
+
+    /// <summary>
+    /// Terminal escape sequence for the CLI to write (e.g. a bell or title
+    /// change). TS <c>SyncHookJSONOutput.terminalSequence</c>.
+    /// </summary>
+    [JsonPropertyName("terminalSequence")]
+    public string? TerminalSequence { get; init; }
 
     [JsonPropertyName("hookSpecificOutput")]
     public JsonElement? HookSpecificOutput { get; init; }

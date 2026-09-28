@@ -54,6 +54,34 @@ public record TaskStartedMessage : SystemMessage
 
     [JsonPropertyName("task_type")]
     public string? TaskType { get; init; }
+
+    /// <summary>Sub-agent type that runs the task. TS <c>subagent_type</c>.</summary>
+    [JsonPropertyName("subagent_type")]
+    public string? SubagentType { get; init; }
+
+    /// <summary>True when the task runs in the background. TS <c>is_backgrounded</c>.</summary>
+    [JsonPropertyName("is_backgrounded")]
+    public bool? IsBackgrounded { get; init; }
+
+    /// <summary>Nesting depth of the spawning agent. TS <c>spawn_depth</c>.</summary>
+    [JsonPropertyName("spawn_depth")]
+    public int? SpawnDepth { get; init; }
+
+    /// <summary>Workflow name, for workflow tasks. TS <c>workflow_name</c>.</summary>
+    [JsonPropertyName("workflow_name")]
+    public string? WorkflowName { get; init; }
+
+    /// <summary>Prompt the task was started with. TS <c>prompt</c>.</summary>
+    [JsonPropertyName("prompt")]
+    public string? Prompt { get; init; }
+
+    /// <summary>When true, the task's messages are not written to the transcript. TS <c>skip_transcript</c>.</summary>
+    [JsonPropertyName("skip_transcript")]
+    public bool? SkipTranscript { get; init; }
+
+    /// <summary>True for ambient (non-user-initiated) tasks. TS <c>ambient</c>.</summary>
+    [JsonPropertyName("ambient")]
+    public bool? Ambient { get; init; }
 }
 
 /// <summary>
@@ -81,6 +109,14 @@ public record TaskProgressMessage : SystemMessage
 
     [JsonPropertyName("last_tool_name")]
     public string? LastToolName { get; init; }
+
+    /// <summary>Sub-agent type that runs the task. TS <c>subagent_type</c>.</summary>
+    [JsonPropertyName("subagent_type")]
+    public string? SubagentType { get; init; }
+
+    /// <summary>Progress summary. TS <c>summary</c>.</summary>
+    [JsonPropertyName("summary")]
+    public string? Summary { get; init; }
 }
 
 /// <summary>
@@ -112,6 +148,26 @@ public record TaskNotificationMessage : SystemMessage
 
     [JsonPropertyName("usage")]
     public TaskUsage? Usage { get; init; }
+
+    /// <summary>The exact <c>status</c> string from the wire (preserved when <see cref="Status"/> is Unknown).</summary>
+    [JsonPropertyName("status_raw")]
+    public string? StatusRaw { get; init; }
+
+    /// <summary>Why the task ended, e.g. <c>"worker_restart"</c>. TS <c>reason</c>.</summary>
+    [JsonPropertyName("reason")]
+    public string? Reason { get; init; }
+
+    /// <summary>MCP resource links produced by the task. TS <c>resource_links</c>.</summary>
+    [JsonPropertyName("resource_links")]
+    public IReadOnlyList<McpResourceLink>? ResourceLinks { get; init; }
+
+    /// <summary>When true, the task's messages are not written to the transcript. TS <c>skip_transcript</c>.</summary>
+    [JsonPropertyName("skip_transcript")]
+    public bool? SkipTranscript { get; init; }
+
+    /// <summary>True for ambient (non-user-initiated) tasks. TS <c>ambient</c>.</summary>
+    [JsonPropertyName("ambient")]
+    public bool? Ambient { get; init; }
 }
 
 #endregion
@@ -155,7 +211,9 @@ public enum RateLimitType
     SevenDay,
     SevenDayOpus,
     SevenDaySonnet,
-    Overage
+    Overage,
+    /// <summary>Seven-day window including overage. TS 0.3.283.</summary>
+    SevenDayOverageIncluded
 }
 
 internal static class RateLimitEnumHelpers
@@ -183,7 +241,19 @@ internal static class RateLimitEnumHelpers
         RateLimitType.SevenDayOpus => "seven_day_opus",
         RateLimitType.SevenDaySonnet => "seven_day_sonnet",
         RateLimitType.Overage => "overage",
+        RateLimitType.SevenDayOverageIncluded => "seven_day_overage_included",
         _ => t.ToString().ToLowerInvariant()
+    };
+
+    public static RateLimitType? ParseRateLimitType(string? value) => value switch
+    {
+        "five_hour" => RateLimitType.FiveHour,
+        "seven_day" => RateLimitType.SevenDay,
+        "seven_day_opus" => RateLimitType.SevenDayOpus,
+        "seven_day_sonnet" => RateLimitType.SevenDaySonnet,
+        "overage" => RateLimitType.Overage,
+        "seven_day_overage_included" => RateLimitType.SevenDayOverageIncluded,
+        _ => null
     };
 }
 
@@ -216,6 +286,41 @@ public record RateLimitInfo
 
     [JsonPropertyName("raw")]
     public JsonElement? Raw { get; init; }
+
+    /// <summary>
+    /// The exact <c>rateLimitType</c> string from the wire, preserved when
+    /// <see cref="RateLimitType"/> is <c>null</c> because the value is new.
+    /// </summary>
+    [JsonPropertyName("rate_limit_type_raw")]
+    public string? RateLimitTypeRaw { get; init; }
+
+    /// <summary>TS <c>isUsingOverage</c>.</summary>
+    [JsonPropertyName("is_using_overage")]
+    public bool? IsUsingOverage { get; init; }
+
+    /// <summary>TS <c>overageInUse</c>.</summary>
+    [JsonPropertyName("overage_in_use")]
+    public bool? OverageInUse { get; init; }
+
+    /// <summary>Utilization threshold that was crossed. TS <c>surpassedThreshold</c>.</summary>
+    [JsonPropertyName("surpassed_threshold")]
+    public double? SurpassedThreshold { get; init; }
+
+    /// <summary><c>service</c>, <c>channel</c> or <c>group_pool</c>. TS <c>limitScope</c>.</summary>
+    [JsonPropertyName("limit_scope")]
+    public string? LimitScope { get; init; }
+
+    /// <summary>E.g. <c>credits_required</c>. TS <c>errorCode</c>.</summary>
+    [JsonPropertyName("error_code")]
+    public string? ErrorCode { get; init; }
+
+    /// <summary>TS <c>canUserPurchaseCredits</c>.</summary>
+    [JsonPropertyName("can_user_purchase_credits")]
+    public bool? CanUserPurchaseCredits { get; init; }
+
+    /// <summary>TS <c>hasChargeableSavedPaymentMethod</c>.</summary>
+    [JsonPropertyName("has_chargeable_saved_payment_method")]
+    public bool? HasChargeableSavedPaymentMethod { get; init; }
 }
 
 /// <summary>
@@ -251,6 +356,53 @@ public record HookEventMessage : SystemMessage
 
     [JsonPropertyName("uuid")]
     public string? Uuid { get; init; }
+
+    /// <summary>Hook execution id (correlates started/progress/response). TS <c>hook_id</c>.</summary>
+    [JsonPropertyName("hook_id")]
+    public string? HookId { get; init; }
+
+    /// <summary>Hook name. TS <c>hook_name</c>.</summary>
+    [JsonPropertyName("hook_name")]
+    public string? HookName { get; init; }
+
+    /// <summary>Combined hook output (hook_progress / hook_response). TS <c>output</c>.</summary>
+    [JsonPropertyName("output")]
+    public string? Output { get; init; }
+
+    /// <summary>Hook stdout (hook_progress / hook_response). TS <c>stdout</c>.</summary>
+    [JsonPropertyName("stdout")]
+    public string? Stdout { get; init; }
+
+    /// <summary>Hook stderr (hook_progress / hook_response). TS <c>stderr</c>.</summary>
+    [JsonPropertyName("stderr")]
+    public string? Stderr { get; init; }
+
+    /// <summary>Process exit code (hook_response). TS <c>exit_code</c>.</summary>
+    [JsonPropertyName("exit_code")]
+    public int? ExitCode { get; init; }
+
+    /// <summary><c>success</c>, <c>error</c> or <c>cancelled</c> (hook_response). TS <c>outcome</c>.</summary>
+    [JsonPropertyName("outcome")]
+    public string? Outcome { get; init; }
+}
+
+/// <summary>
+/// Streaming hook output (<c>hook_progress</c>). Derives from
+/// <see cref="HookEventMessage"/> so hook consumers see the whole lifecycle;
+/// Python leaves this subtype as a plain <see cref="SystemMessage"/>.
+/// TS <c>SDKHookProgressMessage</c>.
+/// </summary>
+public record HookProgressMessage : HookEventMessage
+{
+    /// <summary>Create an empty hook progress message.</summary>
+    public HookProgressMessage()
+    {
+    }
+
+    [System.Diagnostics.CodeAnalysis.SetsRequiredMembers]
+    internal HookProgressMessage(HookEventMessage source) : base(source)
+    {
+    }
 }
 
 #endregion
@@ -348,6 +500,10 @@ public record McpStatusToolInfo
 
     [JsonPropertyName("annotations")]
     public McpStatusToolAnnotations? Annotations { get; init; }
+
+    /// <summary>Tool <c>_meta</c> object, raw. TS 0.3.283.</summary>
+    [JsonPropertyName("_meta")]
+    public JsonElement? Meta { get; init; }
 }
 
 /// <summary>
@@ -413,6 +569,10 @@ public record McpServerStatus
 
     [JsonPropertyName("scope")]
     public string? Scope { get; init; }
+
+    /// <summary>Where the server config came from. TS <c>McpServerStatus.source</c>.</summary>
+    [JsonPropertyName("source")]
+    public string? Source { get; init; }
 
     [JsonPropertyName("tools")]
     public IReadOnlyList<McpStatusToolInfo>? Tools { get; init; }
@@ -610,6 +770,11 @@ public record PostToolUseHookSpecificOutput
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
 
+    /// <summary>Extra context for the auto-mode classifier. TS 0.3.283.</summary>
+    [JsonPropertyName("classifierContext")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ClassifierContext { get; init; }
+
     /// <summary>Replaces the tool output before it is sent to the model. Python commit b0b652f.</summary>
     [JsonPropertyName("updatedToolOutput")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -655,6 +820,16 @@ public record UserPromptSubmitHookSpecificOutput
     [JsonPropertyName("additionalContext")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
+
+    /// <summary>Sets the session title. TS 0.3.283.</summary>
+    [JsonPropertyName("sessionTitle")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SessionTitle { get; init; }
+
+    /// <summary>When true, the original prompt is not sent to the model. TS 0.3.283.</summary>
+    [JsonPropertyName("suppressOriginalPrompt")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? SuppressOriginalPrompt { get; init; }
 }
 
 /// <summary>Hook-specific output for SessionStart events. Python: <c>SessionStartHookSpecificOutput</c>.</summary>
@@ -673,6 +848,26 @@ public record SessionStartHookSpecificOutput
     [JsonPropertyName("additionalContext")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? AdditionalContext { get; init; }
+
+    /// <summary>A user message to start the session with. TS 0.3.283.</summary>
+    [JsonPropertyName("initialUserMessage")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? InitialUserMessage { get; init; }
+
+    /// <summary>Sets the session title. TS 0.3.283.</summary>
+    [JsonPropertyName("sessionTitle")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? SessionTitle { get; init; }
+
+    /// <summary>Paths to watch; changes fire <see cref="HookEvent.FileChanged"/>. TS 0.3.283.</summary>
+    [JsonPropertyName("watchPaths")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public IReadOnlyList<string>? WatchPaths { get; init; }
+
+    /// <summary>Reload skills after the hook runs. TS 0.3.283.</summary>
+    [JsonPropertyName("reloadSkills")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? ReloadSkills { get; init; }
 }
 
 /// <summary>Hook-specific output for Notification events. Python: <c>NotificationHookSpecificOutput</c>.</summary>
@@ -724,9 +919,21 @@ public record PermissionRequestHookSpecificOutput
     [JsonPropertyName("hookEventName")]
     public string HookEventName => "PermissionRequest";
 
-    /// <summary>The permission decision object, passed to the CLI as-is.</summary>
+    /// <summary>
+    /// The permission decision object, passed to the CLI as-is. Build it from a
+    /// <see cref="PermissionRequestDecision"/> with <see cref="From"/>, or read
+    /// it back with <see cref="TypedDecision"/>.
+    /// </summary>
     [JsonPropertyName("decision")]
     public required JsonElement Decision { get; init; }
+
+    /// <summary>Typed view of <see cref="Decision"/>; <c>null</c> if it isn't a recognized allow/deny object.</summary>
+    [JsonIgnore]
+    public PermissionRequestDecision? TypedDecision => PermissionRequestDecision.Parse(Decision);
+
+    /// <summary>Create an output carrying a typed allow/deny decision (TS union).</summary>
+    public static PermissionRequestHookSpecificOutput From(PermissionRequestDecision decision) =>
+        new() { Decision = decision.ToJsonElement() };
 }
 
 #endregion

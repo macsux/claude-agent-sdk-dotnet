@@ -84,6 +84,7 @@ Reference: `claude-agent-sdk-python` **0.2.158** (bundled CLI 2.1.280),
 | `AssistantMessage.error` read from the **top-level** frame | `Error` | fixed (was read from `message.error`) |
 | assistant non-list content → error | `MessageParseException` | ok |
 | `TextBlock`, `ThinkingBlock`, `ToolUseBlock`, `ToolResultBlock`, `ServerToolUseBlock`, `ServerToolResultBlock` (`advisor_tool_result`) | same | ok (`ToolResultBlock.is_error: null` no longer throws) |
+| unknown assistant content block → skipped | `RawContentBlock` | diff: TS parity (see below) |
 | `SystemMessage`, `TaskStartedMessage`, `TaskProgressMessage`, `TaskNotificationMessage`, `MirrorErrorMessage` | same | ok |
 | `TaskUpdatedMessage` (defensive parse of `task_updated`) | `TaskUpdatedMessage` | fixed (type existed but `task_updated` parsed as plain `SystemMessage`) |
 | `HookEventMessage` (`hook_started`/`hook_response`) | same | ok |
@@ -95,7 +96,7 @@ Reference: `claude-agent-sdk-python` **0.2.158** (bundled CLI 2.1.280),
 | `StreamEvent` | same | ok |
 | `RateLimitEvent` / `RateLimitInfo` (raw status passed through) | same; unknown status → `RateLimitStatus.Unknown` | fixed (unknown status used to throw) |
 | `ConversationResetMessage` (`conversation_reset`) | `ConversationResetMessage : Message` | fixed (type existed, was not a `Message` and never parsed) |
-| unknown top-level type → skipped | `ParseOrNull` returns null | ok |
+| unknown top-level type → skipped | `UnknownMessage` (full frame on `Message.Raw`); only `keep_alive` is skipped | diff: follows the TypeScript SDK, see [TypeScript SDK 0.3.283](#typescript-sdk-03283-messages-hooks-permission-types) |
 | `TERMINAL_TASK_STATUSES`, `TaskUpdatedStatus`, `TaskNotificationStatus`, `TaskUsage`, `MessageOriginKind`, `TaskNotificationOriginSubkind`, `ServerToolName`, `DeferredToolUse` | same | ok |
 
 ## ClaudeSDKClient (`client.py`)
@@ -190,3 +191,89 @@ Out of scope for this pass (listed for completeness):
    still does not list `ConversationResetMessage` / `RateLimitEvent`.
    `McpSdkServerBuilder.Tool(string, Delegate, ...)` requires reflection; use the explicit-schema or
    `JsonTypeInfo<TArgs>` overloads in trimmed/AOT apps.
+
+## TypeScript SDK 0.3.283: messages, hooks, permission types
+
+Reference: `@anthropic-ai/claude-agent-sdk` **0.3.283** (`sdk.d.ts`). This section tracks where
+.NET goes beyond Python to match the TypeScript SDK. Columns: **TS** = TypeScript type, **Py** =
+Python 0.2.160 behaviour, **.NET** = this SDK. Everything is parsed by hand from `JsonElement`
+(no reflection), new records are registered in `SdkJsonContext`, and the library stays free of
+IL2xxx/IL3xxx warnings. Parsers for the TS-only shapes are lenient: missing or mistyped fields
+become defaults, never a stream-breaking exception.
+
+### Raw access and unknown types
+
+| TS | Py | .NET | Status |
+|---|---|---|---|
+| every `SDKMessage` is the untouched object | no raw frame (system `data` only) | `Message.Raw` (full frame, `[JsonIgnore]`) on every parsed message; `SystemMessage.Raw == Data` | added |
+| unknown top-level `type` yielded as-is | dropped (`None`) | `UnknownMessage { Type }` yielded by `ReceiveMessagesAsync`; `keep_alive` still skipped | diff (TS behaviour) |
+| unknown content blocks passed through | dropped | assistant: `RawContentBlock(Type, Raw)`; user `GetContentBlocks()` still skips (Python parity) | diff (TS behaviour) |
+
+### Top-level messages
+
+| TS | Py | .NET | Status |
+|---|---|---|---|
+| `SDKToolProgressMessage` (`tool_progress`, incl. `subagent_retry`) | dropped | `ToolProgressMessage`, `SubagentRetryInfo` | added |
+| `SDKToolUseSummaryMessage` | dropped | `ToolUseSummaryMessage` | added |
+| `SDKAuthStatusMessage` | dropped | `AuthStatusMessage` | added |
+| `SDKPromptSuggestionMessage` | dropped | `PromptSuggestionMessage` | added |
+| `SDKActiveGoalMessage` (`value` or null) | dropped | `ActiveGoalMessage`, `ActiveGoal` | added |
+| `SDKAssistantMessage` extras: `request_id, user_message_uuid(s), resume_reason, resumed_from_incomplete_thinking, supersedes, aborted, subagent_type, task_description, timestamp, context_usage, usage_report`, inner `stop_sequence` | raw only | `AssistantMessage.RequestId … StopSequence`, `ContextUsage: SdkContextUsage`, `UsageReport: SdkUsageReport` | added |
+| `SDKAssistantMessageError` (13 values) | raw string | `AssistantMessageError` + 7 values (appended after `Unknown`, numeric values stable); `AssistantMessage.ErrorRaw` keeps the wire string; `AssistantMessageErrors.Parse/ToWireString` | fixed (unknowns were collapsed) |
+| `SDKUserMessage` / `SDKUserMessageReplay` extras: `session_id, isSynthetic, isReplay, priority, timestamp, shouldQuery, client_composed, file_attachments, pasted_content, inline_pastes, subagent_type, task_description` | partial | `UserMessage.SessionId … TaskDescription` (`IsReplay` distinguishes replays) | added |
+| `SDKResultMessage` extras: `queued_turn_count, result_index, fast_mode_state, fast_mode_disabled_reason, startup_failure_reason, user_message_uuid(s), resume_reason, local_command, ttft_ms, ttft_stream_ms, time_to_request_ms` | raw only | `ResultMessage` properties of the same names | added |
+| `SDKPermissionDenial[]` | raw list | `ResultMessage.GetPermissionDenials()` → `PermissionDenial` (raw `PermissionDenials` kept) | added |
+| timing internals (`request_sent_wall_ms`, `first_*`, `warm_spare_claimed`, `time_origin_ms`, …) | raw | via `Message.Raw` | diff (not typed; internal telemetry) |
+| `ModelUsage.thinkingTokens/costBasis` | dropped | `ModelUsage.ThinkingTokens/CostBasis` | added |
+| `SDKPartialAssistantMessage` extras (`ttft_ms, user_message_uuid(s), resume_reason`) | raw | `StreamEvent` properties | added |
+| `SDKRateLimitInfo` extras + `seven_day_overage_included` | raw string | `RateLimitType.SevenDayOverageIncluded`; `RateLimitInfo.RateLimitTypeRaw`, `IsUsingOverage, OverageInUse, SurpassedThreshold, LimitScope, ErrorCode, CanUserPurchaseCredits, HasChargeableSavedPaymentMethod` | added |
+| `SDKConversationResetMessage.trigger/user_message_uuid/timestamp` | dropped | `ConversationResetMessage` properties | added |
+| `McpServerStatus.source`, tool `_meta` | dropped | `McpServerStatus.Source`, `McpStatusToolInfo.Meta` | added |
+
+### `system` subtypes (all subclass `SystemMessage`; `Data` unchanged)
+
+| TS | Py | .NET | Status |
+|---|---|---|---|
+| `SDKSystemMessage` (`init`) | `SystemMessage` | `SystemInitMessage` (+ `InitMcpServer`, `InitPlugin`, `InitPluginError`) | added |
+| `compact_boundary`, `status`, `api_retry`, `control_request_progress` | `SystemMessage` | `CompactBoundaryMessage` (`CompactMetadata`), `StatusMessage`, `ApiRetryMessage` (`Error` + `ErrorRaw`, `NoResponse`), `ControlRequestProgressMessage` | added |
+| `model_refusal_fallback`, `model_refusal_no_fallback`, `local_command_output`, `plugin_install` | `SystemMessage` | `ModelRefusalFallbackMessage`, `ModelRefusalNoFallbackMessage`, `LocalCommandOutputMessage`, `PluginInstallMessage` | added |
+| `background_tasks_changed`, `thinking_tokens`, `session_state_changed`, `worker_shutting_down`, `commands_changed` | `SystemMessage` | `BackgroundTasksChangedMessage`, `ThinkingTokensMessage`, `SessionStateChangedMessage`, `WorkerShuttingDownMessage`, `CommandsChangedMessage` (`SlashCommand[]`) | added |
+| `notification`, `files_persisted`, `memory_recall`, `elicitation_complete`, `permission_denied`, `informational` | `SystemMessage` | `NotificationMessage`, `FilesPersistedMessage`, `MemoryRecallMessage`, `ElicitationCompleteMessage`, `PermissionDeniedMessage`, `InformationalMessage` | added |
+| `hook_started` / `hook_response` fields `hook_id, hook_name, output, stdout, stderr, exit_code, outcome` | `HookEventMessage` (name only) | `HookEventMessage.HookId … Outcome` | added |
+| `hook_progress` | `SystemMessage` | `HookProgressMessage : HookEventMessage` | diff (typed; consumers filtering `HookEventMessage` now also see progress) |
+| `task_started/progress/notification/updated` extras (`subagent_type, is_backgrounded, spawn_depth, workflow_name, prompt, skip_transcript, ambient, summary, reason, resource_links`, typed patch) | raw | `TaskStartedMessage` / `TaskProgressMessage` / `TaskNotificationMessage` (+ `StatusRaw`, `McpResourceLink`) / `TaskUpdatedMessage.TypedPatch` | added |
+| `mirror_error` key `{projectKey, sessionId}` | `{project_key, session_id}` | Python shape | diff (kept at Python parity; SDK-synthesized) |
+
+### Info types (`Types.Info.cs`)
+
+| TS | .NET | Status |
+|---|---|---|
+| `SlashCommand`, `AgentInfo`, `ModelInfo`, `AccountInfo` | records of the same names, each with lenient `static Parse(JsonElement)` | added |
+| `SDKControlInitializeResponse` | `InitializeResponse` + `InitializeResponse.Parse(JsonElement)` (keeps `Raw`) | added |
+| `SDKContextUsage` (per assistant message) | `SdkContextUsage` (+ category / tool / file / agent / skill records) | added |
+| `SDKUsageReport` | `SdkUsageReport` (`SdkUsageSession`, `SdkUsageRateLimits`, `SdkUsageRateLimit`, `SdkUsageExtraUsage`) | added |
+| `TerminalReason`, `FastModeState`, `FastModeDisabledReason`, `ApiKeySource`, `SDKStartupFailureReason`, `SDKStatus` | string constants: `TerminalReasons`, `FastModeStates`, `FastModeDisabledReasons`, `ApiKeySources`, `StartupFailureReasons`, `SdkStatuses` (properties stay `string` so new values pass through) | added |
+
+### Hooks
+
+| TS | Py | .NET | Status |
+|---|---|---|---|
+| `HOOK_EVENTS` (33) | 10 | `HookEvent` has all 33 (original 10 keep their numeric values); wire name via `ToJsonString()` / `HookEventNames.ToWireName` | added |
+| string-keyed hooks (any event name) | arbitrary dict keys | `HookEventNames.Parse(string)` returns a named member or registers a custom value sent under the exact name; `HooksBuilder.On(string eventName, …)` | added |
+| initialize `hooks` keys | wire names | `QueryHandler.InitializeAsync` now uses `ToJsonString()` (was `Enum.ToString()`) | fixed |
+| `BaseHookInput.prompt_id/effort/agent_id/agent_type` | partial | `BaseHookInput.PromptId/Effort/AgentId/AgentType` (+ `Raw`); tool-hook `AgentId/AgentType` moved to the base | added |
+| per-event input extras (`mcp_server`, `duration_ms`, `source`, `session_title`, `last_assistant_message`, `background_tasks`, `session_crons`, typed `permission_suggestions`) | partial | `McpServer` (`McpServerProvenance`), `DurationMs`, `Source`, `SessionTitle`, `LastAssistantMessage`, `BackgroundTasks`, `SessionCrons`, `PermissionRequestHookInput.Suggestions` | added |
+| 23 new `*HookInput` types (`PostToolBatch` … `MessageDisplay`) | none | records of the same names (`ModelSwitchHookInput` / `TeamTaskHookInput` share fields) | added |
+| `HookInput` union | none | `HookInput.Parse(JsonElement)` / `ParseAs<T>` — reflection-free dispatcher; unknown events → `UnknownHookInput` | added |
+| `SyncHookJSONOutput.terminalSequence`, `decision: 'approve'\|'block'` | none / `'block'` | `HookOutput.TerminalSequence` (sent as `terminalSequence`), `HookDecision.Approve/Block`, `HookPermissionDecision` constants | added |
+| output extras: PostToolUse `classifierContext`; UserPromptSubmit `sessionTitle, suppressOriginalPrompt`; SessionStart `initialUserMessage, sessionTitle, watchPaths, reloadSkills` | none | properties on the existing records | added |
+| new hook-specific outputs: Stop, SubagentStop, UserPromptExpansion, Setup, PreModelSwitch, PostModelSwitch, PostToolBatch, PermissionDenied, Elicitation, ElicitationResult, CwdChanged, FileChanged, WorktreeCreate, MessageDisplay | none | `*HookSpecificOutput` records with `ToJsonElement()` (source-generated) | added |
+| `PermissionRequestHookSpecificOutput.decision` union | dict | `PermissionRequestDecision` (`Allow(...)` / `Deny(...)`, `Parse`), `PermissionRequestHookSpecificOutput.From(decision)` / `TypedDecision` | added |
+
+### Permission types
+
+| TS | Py | .NET | Status |
+|---|---|---|---|
+| `PermissionUpdateDestination` `cliArg` | missing | `PermissionUpdateDestination.CliArg` (appended; `ToJsonString`, `FromControlProtocol`, `FromDictionary`) | added |
+| `PermissionResult.toolUseID/decisionClassification`, `CanUseTool` options (`mcpServer, defaultToNo, suppressAlwaysAllowRule, requestId, matchedAskRule`) | missing | tracked with the control-protocol work (`QueryHandler.HandleCanUseToolAsync`) | follow-up |
+

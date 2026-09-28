@@ -305,7 +305,7 @@ public sealed class ControlProtocolParityTests
 public sealed class MessageParserForwardCompatTests
 {
     [Fact]
-    public void UnknownContentBlocksAreSkipped()
+    public void UnknownContentBlocksArePreservedRaw()
     {
         var json = JsonSerializer.SerializeToElement(new
         {
@@ -321,8 +321,11 @@ public sealed class MessageParserForwardCompatTests
             }
         });
 
+        // TS parity: unknown blocks are kept as RawContentBlock (Python drops them).
         var msg = Assert.IsType<AssistantMessage>(MessageParser.Parse(json));
-        Assert.IsType<TextBlock>(Assert.Single(msg.Content));
+        Assert.Equal(2, msg.Content.Count);
+        Assert.Equal("some_future_block", Assert.IsType<RawContentBlock>(msg.Content[0]).Type);
+        Assert.IsType<TextBlock>(msg.Content[1]);
     }
 
     [Theory]

@@ -12,12 +12,17 @@ namespace Claude.AgentSdk.Internal;
 internal static class MessageParser
 {
     /// <summary>
-    /// Parse message from CLI output into typed Message objects.
-    /// Returns <c>null</c> for unknown top-level message types so newer CLI
-    /// versions don't break older SDK versions. Python commit 146e3d6.
+    /// Parse message from CLI output into typed Message objects. Every parsed
+    /// message carries the full frame on <see cref="Message.Raw"/>.
     /// </summary>
+    /// <remarks>
+    /// Unrecognized top-level types become <see cref="UnknownMessage"/> (TS SDK
+    /// behaviour). Python instead returns <c>None</c> for them (commit 146e3d6);
+    /// this SDK follows TS so new CLI message types are never lost. Only
+    /// internal frames (<c>keep_alive</c>) return <c>null</c>.
+    /// </remarks>
     /// <param name="data">Raw message JSON from CLI output.</param>
-    /// <returns>Parsed Message object, or <c>null</c> if the message type is unknown.</returns>
+    /// <returns>Parsed Message object, or <c>null</c> for internal frames.</returns>
     /// <exception cref="MessageParseException">If parsing fails for a known type.</exception>
     public static Message? ParseOrNull(JsonElement data)
     {
@@ -29,24 +34,42 @@ internal static class MessageParser
             );
         }
 
-        // Hook events arrive as system messages with subtype hook_started/hook_response.
-        // Python commit c1182a4.
+        var msg = ParseCore(data);
+        if (msg == null)
+            return null;
+        var raw = msg is SystemMessage sys && sys.Data.ValueKind == JsonValueKind.Object ? sys.Data : data.Clone();
+        return msg with { Raw = raw };
+    }
+
+    private static Message? ParseCore(JsonElement data)
+    {
+        // Hook events arrive as system messages with subtype hook_started/hook_response
+        // (Python commit c1182a4); hook_progress is routed here too (TS parity).
         if (Str(data, "type") == "system" &&
-            Str(data, "subtype") is "hook_started" or "hook_response")
+            Str(data, "subtype") is "hook_started" or "hook_response" or "hook_progress")
         {
+            var subtype = Str(data, "subtype")!;
             var hookEventName =
                 NonEmpty(Str(data, "hook_event"))
                 ?? NonEmpty(Str(data, "hook_name"))
                 ?? NonEmpty(Str(data, "hook_event_name"))
                 ?? string.Empty;
-            return new HookEventMessage
+            var hookMsg = new HookEventMessage
             {
-                Subtype = Str(data, "subtype")!,
+                Subtype = subtype,
                 Data = data.Clone(),
                 HookEventName = hookEventName,
                 SessionId = Str(data, "session_id"),
-                Uuid = Str(data, "uuid")
+                Uuid = Str(data, "uuid"),
+                HookId = Str(data, "hook_id"),
+                HookName = Str(data, "hook_name"),
+                Output = Str(data, "output"),
+                Stdout = Str(data, "stdout"),
+                Stderr = Str(data, "stderr"),
+                ExitCode = Int(data, "exit_code"),
+                Outcome = Str(data, "outcome")
             };
+            return subtype == "hook_progress" ? new HookProgressMessage(hookMsg) : hookMsg;
         }
 
         var messageType = Str(data, "type");
@@ -62,20 +85,27 @@ internal static class MessageParser
             "stream_event" => ParseStreamEvent(data),
             "rate_limit_event" => ParseRateLimitEvent(data),
             "conversation_reset" => ParseConversationReset(data),
-            _ => LogAndSkipUnknown(messageType)
+            // TS 0.3.283 top-level types that Python drops.
+            "tool_progress" => TsParsing.ParseToolProgress(data),
+            "tool_use_summary" => TsParsing.ParseToolUseSummary(data),
+            "auth_status" => TsParsing.ParseAuthStatus(data),
+            "prompt_suggestion" => TsParsing.ParsePromptSuggestion(data),
+            "active_goal" => TsParsing.ParseActiveGoal(data),
+            // Internal liveness frame; the TS SDK swallows it too.
+            "keep_alive" => SkipInternal(messageType),
+            _ => new UnknownMessage { Type = messageType }
         };
     }
 
-    private static Message? LogAndSkipUnknown(string? messageType)
+    private static Message? SkipInternal(string messageType)
     {
-        Debug.WriteLine($"[MessageParser] Skipping unknown message type: {messageType}");
+        Debug.WriteLine($"[MessageParser] Skipping internal message type: {messageType}");
         return null;
     }
 
     /// <summary>
-    /// Legacy entry point: parse message and throw on unknown types.
-    /// Prefer <see cref="ParseOrNull"/>, which mirrors Python's forward-compatible
-    /// behavior of skipping unknown types.
+    /// Legacy entry point: parse message and throw when the frame is internal
+    /// (<c>keep_alive</c>). Unknown types parse as <see cref="UnknownMessage"/>.
     /// </summary>
     public static Message Parse(JsonElement data)
     {
@@ -199,7 +229,19 @@ internal static class MessageParser
                 Uuid = Str(data, "uuid"),
                 ParentToolUseId = Str(data, "parent_tool_use_id"),
                 ToolUseResult = Raw(data, "tool_use_result"),
-                Origin = ParseOrigin(data)
+                Origin = ParseOrigin(data),
+                SessionId = Str(data, "session_id"),
+                IsSynthetic = Bool(data, "isSynthetic"),
+                IsReplay = Bool(data, "isReplay"),
+                Priority = Str(data, "priority"),
+                Timestamp = Str(data, "timestamp"),
+                ShouldQuery = Bool(data, "shouldQuery"),
+                ClientComposed = Bool(data, "client_composed"),
+                FileAttachments = Raw(data, "file_attachments"),
+                PastedContent = Raw(data, "pasted_content"),
+                InlinePastes = JsonRead.StrList(data, "inline_pastes"),
+                SubagentType = Str(data, "subagent_type"),
+                TaskDescription = Str(data, "task_description")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -225,7 +267,8 @@ internal static class MessageParser
             {
                 if (block.ValueKind != JsonValueKind.Object)
                     throw new MessageParseException($"Invalid content block (expected object, got {block.ValueKind})", data);
-                ContentBlock? contentBlock = Req(block, "type") switch
+                var blockType = Req(block, "type");
+                ContentBlock contentBlock = blockType switch
                 {
                     "text" => new TextBlock(Req(block, "text")),
                     "thinking" => new ThinkingBlock(Req(block, "thinking"), Req(block, "signature")),
@@ -233,29 +276,29 @@ internal static class MessageParser
                     "tool_result" => new ToolResultBlock(Req(block, "tool_use_id"), Raw(block, "content"), Bool(block, "is_error")),
                     // Python commit 6ab97b4: server_tool_use / advisor_tool_result.
                     "server_tool_use" => new ServerToolUseBlock(Req(block, "id"), Req(block, "name"), block.GetProperty("input").Clone()),
-                    "advisor_tool_result" => new ServerToolResultBlock(Req(block, "tool_use_id"), block.GetProperty("content").Clone()),
-                    // Python skips block types it doesn't know (forward compatibility
-                    // with newer CLIs) instead of failing the whole message.
-                    _ => null
+                    "advisor_tool_result" => new ServerToolResultBlock(Req(block, "tool_use_id"), block.GetProperty("content").Clone())
+                    {
+                        ResultType = blockType
+                    },
+                    // TS parity: redacted thinking and the other server-tool result blocks.
+                    "redacted_thinking" when Str(block, "data") is { } redacted => new RedactedThinkingBlock(redacted),
+                    "web_search_tool_result" or "web_fetch_tool_result" or "code_execution_tool_result"
+                        or "bash_code_execution_tool_result" or "text_editor_code_execution_tool_result"
+                        or "tool_search_tool_result"
+                        when Str(block, "tool_use_id") is { } resultFor && block.TryGetProperty("content", out var resultContent)
+                        => new ServerToolResultBlock(resultFor, resultContent.Clone()) { ResultType = blockType },
+                    // Python skips block types it doesn't know; this SDK keeps them
+                    // raw (TS parity: content is passed through untouched).
+                    _ => new RawContentBlock(blockType, block.Clone())
                 };
-                if (contentBlock != null)
-                    contentBlocks.Add(contentBlock);
+                contentBlocks.Add(contentBlock);
             }
 
             // Python reads `error` from the top-level frame (data.get("error")),
             // not from the inner API message. The inner location is kept as a
             // fallback for frames produced by older SDK builds.
             var errorStr = Str(data, "error") ?? Str(message, "error");
-            AssistantMessageError? error = errorStr switch
-            {
-                null => null,
-                "authentication_failed" => AssistantMessageError.AuthenticationFailed,
-                "billing_error" => AssistantMessageError.BillingError,
-                "rate_limit" => AssistantMessageError.RateLimit,
-                "invalid_request" => AssistantMessageError.InvalidRequest,
-                "server_error" => AssistantMessageError.ServerError,
-                _ => AssistantMessageError.Unknown
-            };
+            var error = AssistantMessageErrors.Parse(errorStr);
 
             return new AssistantMessage
             {
@@ -268,7 +311,21 @@ internal static class MessageParser
                 MessageId = Str(message, "id"),
                 StopReason = Str(message, "stop_reason"),
                 SessionId = Str(data, "session_id"),
-                Uuid = Str(data, "uuid")
+                Uuid = Str(data, "uuid"),
+                ErrorRaw = errorStr,
+                RequestId = Str(data, "request_id"),
+                UserMessageUuid = Str(data, "user_message_uuid"),
+                UserMessageUuids = JsonRead.StrList(data, "user_message_uuids"),
+                ResumeReason = Str(data, "resume_reason"),
+                ResumedFromIncompleteThinking = Bool(data, "resumed_from_incomplete_thinking"),
+                Supersedes = JsonRead.StrList(data, "supersedes"),
+                Aborted = Bool(data, "aborted"),
+                SubagentType = Str(data, "subagent_type"),
+                TaskDescription = Str(data, "task_description"),
+                Timestamp = Str(data, "timestamp"),
+                ContextUsage = data.TryGetProperty("context_usage", out var cu) ? SdkContextUsage.Parse(cu) : null,
+                UsageReport = data.TryGetProperty("usage_report", out var ur) ? SdkUsageReport.Parse(ur) : null,
+                StopSequence = Str(message, "stop_sequence")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -302,7 +359,14 @@ internal static class MessageParser
                         Uuid = Req(data, "uuid"),
                         SessionId = Req(data, "session_id"),
                         ToolUseId = Str(data, "tool_use_id"),
-                        TaskType = Str(data, "task_type")
+                        TaskType = Str(data, "task_type"),
+                        SubagentType = Str(data, "subagent_type"),
+                        IsBackgrounded = Bool(data, "is_backgrounded"),
+                        SpawnDepth = Int(data, "spawn_depth"),
+                        WorkflowName = Str(data, "workflow_name"),
+                        Prompt = Str(data, "prompt"),
+                        SkipTranscript = Bool(data, "skip_transcript"),
+                        Ambient = Bool(data, "ambient")
                     };
                 case "task_progress":
                     return new TaskProgressMessage
@@ -315,10 +379,13 @@ internal static class MessageParser
                         Uuid = Req(data, "uuid"),
                         SessionId = Req(data, "session_id"),
                         ToolUseId = Str(data, "tool_use_id"),
-                        LastToolName = Str(data, "last_tool_name")
+                        LastToolName = Str(data, "last_tool_name"),
+                        SubagentType = Str(data, "subagent_type"),
+                        Summary = Str(data, "summary")
                     };
                 case "task_notification":
-                    var status = Req(data, "status") switch
+                    var statusRaw = Req(data, "status");
+                    var status = statusRaw switch
                     {
                         "completed" => TaskNotificationStatus.Completed,
                         "failed" => TaskNotificationStatus.Failed,
@@ -340,7 +407,12 @@ internal static class MessageParser
                         ToolUseId = Str(data, "tool_use_id"),
                         Usage = data.TryGetProperty("usage", out var u) && u.ValueKind == JsonValueKind.Object
                             ? ParseTaskUsage(u)
-                            : null
+                            : null,
+                        StatusRaw = statusRaw,
+                        Reason = Str(data, "reason"),
+                        ResourceLinks = JsonRead.ObjListOrNull(data, "resource_links", TsParsing.ParseResourceLink),
+                        SkipTranscript = Bool(data, "skip_transcript"),
+                        Ambient = Bool(data, "ambient")
                     };
                 case "task_updated":
                     // Terminal task completion sometimes arrives only as a
@@ -359,7 +431,16 @@ internal static class MessageParser
                         Patch = patch,
                         Status = Str(patch, "status"),
                         SessionId = Str(data, "session_id"),
-                        Uuid = Str(data, "uuid")
+                        Uuid = Str(data, "uuid"),
+                        TypedPatch = new TaskUpdatedPatch
+                        {
+                            Status = Str(patch, "status"),
+                            Description = Str(patch, "description"),
+                            EndTime = JsonRead.Dbl(patch, "end_time"),
+                            TotalPausedMs = JsonRead.Dbl(patch, "total_paused_ms"),
+                            Error = Str(patch, "error"),
+                            IsBackgrounded = Bool(patch, "is_backgrounded")
+                        }
                     };
                 case "mirror_error":
                     // Python commit 6e3d54f: SDK-synthesized; never emitted by the CLI directly.
@@ -381,11 +462,13 @@ internal static class MessageParser
                         Error = Str(data, "error") ?? string.Empty
                     };
                 default:
-                    return new SystemMessage
-                    {
-                        Subtype = subtype,
-                        Data = clone
-                    };
+                    // TS 0.3.283 typed subtypes; anything else stays a plain SystemMessage.
+                    return TsParsing.ParseSystemSubtype(subtype, data, clone)
+                           ?? new SystemMessage
+                           {
+                               Subtype = subtype,
+                               Data = clone
+                           };
             }
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException)
@@ -394,7 +477,7 @@ internal static class MessageParser
         }
     }
 
-    private static ModelUsage ParseModelUsage(JsonElement e)
+    internal static ModelUsage ParseModelUsage(JsonElement e)
     {
         int I(string name) => e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.Number && v.TryGetInt32(out var i) ? i : 0;
         return new ModelUsage
@@ -408,7 +491,9 @@ internal static class MessageParser
             ContextWindow = I("contextWindow"),
             MaxOutputTokens = I("maxOutputTokens"),
             CanonicalModel = Str(e, "canonicalModel"),
-            Provider = Str(e, "provider")
+            Provider = Str(e, "provider"),
+            ThinkingTokens = Int(e, "thinkingTokens"),
+            CostBasis = Str(e, "costBasis")
         };
     }
 
@@ -467,7 +552,19 @@ internal static class MessageParser
                 ApiErrorStatus = Int(data, "api_error_status"),
                 Uuid = Str(data, "uuid"),
                 TerminalReason = Str(data, "terminal_reason"),
-                Origin = ParseOrigin(data)
+                Origin = ParseOrigin(data),
+                QueuedTurnCount = Int(data, "queued_turn_count"),
+                ResultIndex = Int(data, "result_index"),
+                FastModeState = Str(data, "fast_mode_state"),
+                FastModeDisabledReason = Str(data, "fast_mode_disabled_reason"),
+                StartupFailureReason = Str(data, "startup_failure_reason"),
+                UserMessageUuid = Str(data, "user_message_uuid"),
+                UserMessageUuids = JsonRead.StrList(data, "user_message_uuids"),
+                ResumeReason = Str(data, "resume_reason"),
+                LocalCommand = Str(data, "local_command"),
+                TtftMs = JsonRead.Dbl(data, "ttft_ms"),
+                TtftStreamMs = JsonRead.Dbl(data, "ttft_stream_ms"),
+                TimeToRequestMs = JsonRead.Dbl(data, "time_to_request_ms")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException)
@@ -485,7 +582,11 @@ internal static class MessageParser
                 Uuid = Req(data, "uuid"),
                 SessionId = Req(data, "session_id"),
                 Event = data.GetProperty("event").Clone(),
-                ParentToolUseId = Str(data, "parent_tool_use_id")
+                ParentToolUseId = Str(data, "parent_tool_use_id"),
+                TtftMs = JsonRead.Dbl(data, "ttft_ms"),
+                UserMessageUuid = Str(data, "user_message_uuid"),
+                UserMessageUuids = JsonRead.StrList(data, "user_message_uuids"),
+                ResumeReason = Str(data, "resume_reason")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
@@ -504,15 +605,8 @@ internal static class MessageParser
             var statusStr = Req(info, "status");
             var status = RateLimitEnumHelpers.ParseRateLimitStatus(statusStr) ?? RateLimitStatus.Unknown;
 
-            RateLimitType? rlType = Str(info, "rateLimitType") switch
-            {
-                "five_hour" => RateLimitType.FiveHour,
-                "seven_day" => RateLimitType.SevenDay,
-                "seven_day_opus" => RateLimitType.SevenDayOpus,
-                "seven_day_sonnet" => RateLimitType.SevenDaySonnet,
-                "overage" => RateLimitType.Overage,
-                _ => null
-            };
+            var rlTypeRaw = Str(info, "rateLimitType");
+            var rlType = RateLimitEnumHelpers.ParseRateLimitType(rlTypeRaw);
 
             var overageStr = Str(info, "overageStatus");
             RateLimitStatus? overageStatus = overageStr == null
@@ -531,7 +625,15 @@ internal static class MessageParser
                 OverageResetsAt = info.TryGetProperty("overageResetsAt", out var ora) && ora.ValueKind == JsonValueKind.Number
                     ? ora.GetInt64() : null,
                 OverageDisabledReason = Str(info, "overageDisabledReason"),
-                Raw = info.Clone()
+                Raw = info.Clone(),
+                RateLimitTypeRaw = rlTypeRaw,
+                IsUsingOverage = Bool(info, "isUsingOverage"),
+                OverageInUse = Bool(info, "overageInUse"),
+                SurpassedThreshold = JsonRead.Dbl(info, "surpassedThreshold"),
+                LimitScope = Str(info, "limitScope"),
+                ErrorCode = Str(info, "errorCode"),
+                CanUserPurchaseCredits = Bool(info, "canUserPurchaseCredits"),
+                HasChargeableSavedPaymentMethod = Bool(info, "hasChargeableSavedPaymentMethod")
             };
 
             return new RateLimitEvent
@@ -555,7 +657,10 @@ internal static class MessageParser
             {
                 NewConversationId = Req(data, "new_conversation_id"),
                 Uuid = Req(data, "uuid"),
-                SessionId = Req(data, "session_id")
+                SessionId = Req(data, "session_id"),
+                Trigger = Str(data, "trigger"),
+                UserMessageUuid = Str(data, "user_message_uuid"),
+                Timestamp = Str(data, "timestamp")
             };
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException)
