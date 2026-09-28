@@ -73,7 +73,8 @@ public sealed class WirePayloadNullTests
         });
 
         Assert.Equal(
-            """{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"network":{"allowLocalBinding":true}}}""",
+            // failIfUnavailable: injected for an enabled sandbox (TS parity).
+            """{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"network":{"allowLocalBinding":true},"failIfUnavailable":true}}""",
             ValueOf(cmd, "--settings"));
     }
 
@@ -86,7 +87,7 @@ public sealed class WirePayloadNullTests
             Sandbox = new SandboxSettings { Enabled = true }
         });
 
-        Assert.Equal("""{"model":"x","n":1,"sandbox":{"enabled":true}}""", ValueOf(cmd, "--settings"));
+        Assert.Equal("""{"model":"x","n":1,"sandbox":{"enabled":true,"failIfUnavailable":true}}""", ValueOf(cmd, "--settings"));
     }
 
     [Fact]

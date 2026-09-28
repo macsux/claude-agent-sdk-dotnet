@@ -1010,7 +1010,7 @@ public record PermissionUpdate(
 /// Context information for tool permission callbacks.
 /// Expanded in Python commits 3caf665 and fe0cff3.
 /// </summary>
-public record ToolPermissionContext(
+public partial record ToolPermissionContext(
     object? Signal = null,
     IReadOnlyList<PermissionUpdate>? Suggestions = null,
     string? ToolUseId = null,
@@ -1030,7 +1030,7 @@ public abstract record PermissionResult;
 /// <summary>
 /// Allow permission result.
 /// </summary>
-public record PermissionResultAllow(
+public partial record PermissionResultAllow(
     JsonElement? UpdatedInput = null,
     IReadOnlyList<PermissionUpdate>? UpdatedPermissions = null
 ) : PermissionResult
@@ -1041,7 +1041,7 @@ public record PermissionResultAllow(
 /// <summary>
 /// Deny permission result.
 /// </summary>
-public record PermissionResultDeny(
+public partial record PermissionResultDeny(
     string Message = "",
     bool Interrupt = false
 ) : PermissionResult
@@ -1425,7 +1425,7 @@ public record HookMatcher(
 /// <summary>
 /// MCP stdio server configuration.
 /// </summary>
-public record McpStdioServerConfig
+public partial record McpStdioServerConfig
 {
     [JsonPropertyName("type")]
     public string Type => "stdio";
@@ -1445,7 +1445,7 @@ public record McpStdioServerConfig
 /// <summary>
 /// MCP SSE server configuration.
 /// </summary>
-public record McpSSEServerConfig
+public partial record McpSSEServerConfig
 {
     [JsonPropertyName("type")]
     public string Type => "sse";
@@ -1461,7 +1461,7 @@ public record McpSSEServerConfig
 /// <summary>
 /// MCP HTTP server configuration.
 /// </summary>
-public record McpHttpServerConfig
+public partial record McpHttpServerConfig
 {
     [JsonPropertyName("type")]
     public string Type => "http";
@@ -1498,7 +1498,7 @@ public record McpHttpServerConfig
 /// };
 /// </code>
 /// </example>
-public record McpSdkServerConfig
+public partial record McpSdkServerConfig
 {
     /// <summary>
     /// The server type identifier. Always "sdk" for in-process servers.
@@ -1636,7 +1636,7 @@ public record TaskBudget(
 /// <param name="PermissionMode">Permission mode for the agent.</param>
 /// <param name="Effort">An <see cref="EffortLevel"/> or an int (Python <c>EffortLevel | int</c>); both convert implicitly.</param>
 /// <param name="McpServers">Server names or inline <c>{name: config}</c> maps (Python <c>list[str | dict]</c>); strings and dictionaries convert implicitly.</param>
-public record AgentDefinition(
+public partial record AgentDefinition(
     [property: JsonPropertyName("description")] string Description,
     [property: JsonPropertyName("prompt")] string Prompt,
     [property: JsonPropertyName("tools")] IReadOnlyList<string>? Tools = null,
@@ -1655,7 +1655,7 @@ public record AgentDefinition(
 /// <summary>
 /// SDK plugin configuration.
 /// </summary>
-public record SdkPluginConfig(
+public partial record SdkPluginConfig(
     [property: JsonPropertyName("type")] string Type,
     [property: JsonPropertyName("path")] string Path
 );
@@ -1663,7 +1663,7 @@ public record SdkPluginConfig(
 /// <summary>
 /// Network configuration for sandbox.
 /// </summary>
-public record SandboxNetworkConfig
+public partial record SandboxNetworkConfig
 {
     /// <summary>Domain names that sandboxed processes can access. Python commit 92a4615.</summary>
     [JsonPropertyName("allowedDomains")]
@@ -1723,7 +1723,7 @@ public record SandboxIgnoreViolations
 /// <summary>
 /// Sandbox settings configuration.
 /// </summary>
-public record SandboxSettings
+public partial record SandboxSettings
 {
     [JsonPropertyName("enabled")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -1788,7 +1788,7 @@ public record ThinkingConfigAdaptive : IThinkingConfig
 /// <summary>
 /// Enabled thinking configuration with a specific budget.
 /// </summary>
-public record ThinkingConfigEnabled(int BudgetTokens) : IThinkingConfig
+public record ThinkingConfigEnabled(int? BudgetTokens = null) : IThinkingConfig
 {
     /// <inheritdoc />
     public string Type => "enabled";
@@ -1821,7 +1821,7 @@ public record ThinkingConfigDisabled : IThinkingConfig
 /// <c>dataclasses.replace</c>). <see cref="ToString"/> deliberately omits
 /// members such as <see cref="Env"/> that commonly carry secrets.
 /// </remarks>
-public record ClaudeAgentOptions
+public partial record ClaudeAgentOptions
 {
     /// <summary>Prints only non-sensitive members.</summary>
     protected virtual bool PrintMembers(System.Text.StringBuilder builder)

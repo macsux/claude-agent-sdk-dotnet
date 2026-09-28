@@ -1,6 +1,9 @@
 // Claude Agent SDK for .NET
-// Port of claude-agent-sdk-python/_internal/query.py
+// Port of claude-agent-sdk-python/_internal/query.py, extended with the
+// TypeScript SDK's control-protocol behaviour (sdk.mjs Query class).
 
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -17,26 +20,32 @@ namespace Claude.AgentSdk.Internal;
 /// Manages control request/response routing, hook callbacks, tool permission callbacks,
 /// message streaming, and initialization handshake.
 /// </summary>
-internal class QueryHandler : IAsyncDisposable
+internal partial class QueryHandler : IAsyncDisposable
 {
     private readonly ITransport _transport;
     private readonly ClaudeAgentOptions _options;
     private readonly TimeSpan _initializeTimeout;
     private readonly Channel<JsonElement> _messageChannel;
-    private readonly Dictionary<string, TaskCompletionSource<JsonElement>> _pendingRequests = new();
+    private readonly Dictionary<string, PendingRequest> _pendingRequests = new();
     private readonly Dictionary<string, HookCallback> _hookCallbacks = new();
-    private readonly Dictionary<string, SdkMcpBridge> _sdkMcpBridges = new();
+    private readonly ConcurrentDictionary<string, SdkMcpBridge> _sdkMcpBridges = new();
     private readonly SemaphoreSlim _lock = new(1, 1);
 
     private Task? _readTask;
     private CancellationTokenSource? _readCts;
     private bool _initialized;
-    private bool _closed;
+    private volatile bool _closed;
     private int _closeState;
     private int _requestCounter;
     private int _nextCallbackId;
-    private TaskCompletionSource _firstResultEvent = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private JsonElement? _initializationResult;
+
+    // The initialize request as first built (hooks registered once), re-sent
+    // verbatim by ReinitializeAsync (TS: initHooksPayload is built once).
+    private Dictionary<string, object?>? _initializeRequest;
+
+    // TS: latestCommands, refreshed from system/commands_changed frames.
+    private JsonElement? _latestCommands;
 
     // Python commit 9aafd84: suppress redundant ProcessError after error result.
     // When the CLI emits a result with is_error=true and then exits non-zero,
@@ -47,7 +56,8 @@ internal class QueryHandler : IAsyncDisposable
     private JsonElement? _lastErrorResult;
 
     // Python commit 2c29362: inflight server-initiated control requests so we
-    // can cancel them on control_cancel_request.
+    // can cancel them on control_cancel_request. TS also uses this map to skip
+    // a duplicate delivery of an in-flight request_id.
     private readonly Dictionary<string, CancellationTokenSource> _inflightRequests = new();
 
     /// <summary>Mirror callback invoked when the CLI emits transcript_mirror frames.</summary>
@@ -66,6 +76,8 @@ internal class QueryHandler : IAsyncDisposable
 
     private readonly ILogger _logger;
 
+    private sealed record PendingRequest(TaskCompletionSource<JsonElement> Tcs, string? Subtype);
+
     public QueryHandler(
         ITransport transport,
         ClaudeAgentOptions options,
@@ -75,6 +87,7 @@ internal class QueryHandler : IAsyncDisposable
         _options = options;
         _logger = options.Logger ?? NullLogger.Instance;
         _initializeTimeout = initializeTimeout ?? TimeSpan.FromSeconds(60);
+        _runEndCeilingMs = RunEndCeilingMs(options.Env);
         _messageChannel = Channel.CreateBounded<JsonElement>(new BoundedChannelOptions(100)
         {
             FullMode = BoundedChannelFullMode.Wait
@@ -84,10 +97,11 @@ internal class QueryHandler : IAsyncDisposable
     /// <summary>
     /// Start reading messages from transport.
     /// </summary>
-    public async Task StartAsync(CancellationToken cancellationToken = default)
+    public Task StartAsync(CancellationToken cancellationToken = default)
     {
         _readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _readTask = ReadMessagesLoopAsync(_readCts.Token);
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -123,6 +137,43 @@ internal class QueryHandler : IAsyncDisposable
         if (_initialized)
             return _initializationResult;
 
+        _initializeRequest ??= BuildInitializeRequest();
+        var response = await SendControlRequestAsync(_initializeRequest, _initializeTimeout, cancellationToken);
+        _initialized = true;
+        _initializationResult = response;
+        WarnIfPluginsNotApplied(response);
+        return response;
+    }
+
+    /// <summary>
+    /// Re-send the initialize request (same hook callback ids) and return the
+    /// fresh response. The CLI's answer can carry <c>pending_permission_requests</c>
+    /// / <c>pending_user_dialog_requests</c>, which are redelivered to the
+    /// callbacks (deduplicated by request id). TS: <c>Query.reinitialize</c>.
+    /// </summary>
+    public async Task<JsonElement> ReinitializeAsync(CancellationToken cancellationToken = default)
+    {
+        _initializeRequest ??= BuildInitializeRequest();
+        var response = await SendControlRequestAsync(_initializeRequest, _initializeTimeout, cancellationToken);
+        WarnIfPluginsNotApplied(response);
+        return response;
+    }
+
+    private void WarnIfPluginsNotApplied(JsonElement response)
+    {
+        if (_options.PluginDelivery != PluginDelivery.Initialize || _options.Plugins.Count == 0)
+            return;
+        if (response.ValueKind == JsonValueKind.Object &&
+            response.TryGetProperty("plugins_applied", out var applied) &&
+            applied.ValueKind == JsonValueKind.True)
+            return;
+        _logger.LogWarning(
+            "Claude Code did not report plugins_applied=true for {Count} plugins sent with PluginDelivery.Initialize; " +
+            "the process is running with the plugins it was launched with.", _options.Plugins.Count);
+    }
+
+    private Dictionary<string, object?> BuildInitializeRequest()
+    {
         // Build hooks configuration for initialization
         var hooksConfig = new Dictionary<string, List<Dictionary<string, object?>>>();
 
@@ -182,11 +233,93 @@ internal class QueryHandler : IAsyncDisposable
         if (_options.ForwardSubagentText)
             request["forwardSubagentText"] = true;
 
-        var response = await SendControlRequestAsync(request, _initializeTimeout, cancellationToken);
-        _initialized = true;
-        _initializationResult = response;
-        return response;
+        AddTsInitializeFields(request);
+        return request;
     }
+
+    /// <summary>
+    /// TS-only initialize keys (Query.buildInitializeRequest). Each is sent only
+    /// when set, so CLIs that predate a key never see it.
+    /// </summary>
+    private void AddTsInitializeFields(Dictionary<string, object?> request)
+    {
+        var o = _options;
+
+        // The block-list system prompt has no argv form (TS sends every system
+        // prompt this way; the string forms stay on argv for Python parity).
+        if (o.SystemPrompt is SystemPromptBlocks blocks)
+            request["systemPrompt"] = blocks.Blocks;
+
+        if (SubprocessTransport.JsonSchemaOf(o.OutputFormat) is { } schema)
+            request["jsonSchema"] = schema;
+
+        if (o.Title != null) request["title"] = o.Title;
+        if (o.PlanModeInstructions != null) request["planModeInstructions"] = o.PlanModeInstructions;
+        if (o.AppendSubagentSystemPrompt != null) request["appendSubagentSystemPrompt"] = o.AppendSubagentSystemPrompt;
+        if (o.ToolAliases != null) request["toolAliases"] = o.ToolAliases;
+        if (o.WebSearchIsolationExemptMcpServers != null)
+            request["webSearchIsolationExemptMcpServers"] = o.WebSearchIsolationExemptMcpServers;
+        if (o.PromptSuggestions is { } ps) request["promptSuggestions"] = ps;
+        if (o.AgentProgressSummaries is { } aps) request["agentProgressSummaries"] = aps;
+        if (o.SupportedDialogKinds != null) request["supportedDialogKinds"] = o.SupportedDialogKinds;
+        if (o.PerTaskStopAffordance is { } pts) request["perTaskStopAffordance"] = pts;
+        if (o.RapidFollowupPreempt is { } rfp) request["rapidFollowupPreempt"] = rfp;
+
+        if (ValidatedWorkspaceTrust(o.WorkspaceTrust, _logger) is { } trust)
+        {
+            var t = new Dictionary<string, object?>();
+            if (trust.Accepted is { } accepted) t["accepted"] = accepted;
+            if (trust.Directory != null) t["directory"] = trust.Directory;
+            request["workspaceTrust"] = t;
+        }
+
+        // SDK server timeouts (TS sdkMcpServerConfigs). The servers themselves
+        // stay in --mcp-config (Python parity).
+        if (o.McpServers is McpServersConfig.ServerMap map)
+        {
+            var configs = new Dictionary<string, object?>();
+            foreach (var (name, cfg) in map.Servers)
+            {
+                if (cfg is McpSdkServerConfig { Timeout: { } timeout })
+                    configs[name] = new Dictionary<string, object?> { ["timeout"] = timeout };
+            }
+            if (configs.Count > 0)
+                request["sdkMcpServerConfigs"] = configs;
+        }
+
+        if (o.PluginDelivery == PluginDelivery.Initialize && o.Plugins.Count > 0)
+            request["plugins"] = o.Plugins.Select(PluginPayload).ToList();
+    }
+
+    internal static Dictionary<string, object?> PluginPayload(SdkPluginConfig plugin)
+    {
+        if (plugin.Type != "local")
+            throw new ArgumentException($"Unsupported plugin type: {plugin.Type}");
+        var d = new Dictionary<string, object?> { ["type"] = plugin.Type, ["path"] = plugin.Path };
+        if (plugin.SkipMcpDiscovery is { } skip) d["skipMcpDiscovery"] = skip;
+        return d;
+    }
+
+    /// <summary>
+    /// TS <c>yW</c>: an accepted trust needs an absolute directory (it names a
+    /// path where the CLI runs); otherwise the option is dropped with a warning.
+    /// </summary>
+    internal static WorkspaceTrust? ValidatedWorkspaceTrust(WorkspaceTrust? trust, ILogger logger)
+    {
+        if (trust is null)
+            return null;
+        if (trust.Accepted == true && (trust.Directory is null || !IsAbsolutePathAnyPlatform(trust.Directory)))
+        {
+            logger.LogWarning("WorkspaceTrust ignored: Accepted requires an absolute Directory, as it exists where Claude Code runs");
+            return null;
+        }
+        return trust;
+    }
+
+    // TS checks both path.posix and path.win32.
+    private static bool IsAbsolutePathAnyPlatform(string path) =>
+        path.StartsWith('/') || path.StartsWith('\\') ||
+        (path.Length >= 3 && char.IsAsciiLetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/'));
 
     /// <summary>
     /// Serialize agent definitions the way Python does (<c>asdict</c> minus
@@ -216,6 +349,12 @@ internal class QueryHandler : IAsyncDisposable
                 d["effort"] = def.Effort.ToWire();
             if (def.PermissionMode != null)
                 d["permissionMode"] = SubprocessTransport.PermissionModeToCliValue(def.PermissionMode.Value);
+            // TS-only AgentDefinition keys.
+            if (def.CriticalSystemReminderExperimental != null)
+                d["criticalSystemReminder_EXPERIMENTAL"] = def.CriticalSystemReminderExperimental;
+            if (def.OmitClaudeMd != null) d["omitClaudeMd"] = def.OmitClaudeMd;
+            if (def.Observer != null) d["observer"] = def.Observer;
+            if (def.ObserverMessage != null) d["observerMessage"] = def.ObserverMessage;
             result[name] = d;
         }
         return result;
@@ -226,6 +365,12 @@ internal class QueryHandler : IAsyncDisposable
     /// </summary>
     public JsonElement? GetInitializationResult() => _initializationResult;
 
+    /// <summary>
+    /// The latest command list from a <c>system/commands_changed</c> frame, or
+    /// null when none has arrived (TS: <c>latestCommands</c>).
+    /// </summary>
+    public JsonElement? GetLatestCommands() => _latestCommands;
+
     private async Task ReadMessagesLoopAsync(CancellationToken cancellationToken)
     {
         Exception? finalException = null;
@@ -235,6 +380,13 @@ internal class QueryHandler : IAsyncDisposable
             {
                 if (_closed)
                     break;
+
+                // Raw frame tap (.NET addition): every frame, before routing.
+                if (_options.OnRawMessage is { } tap)
+                {
+                    try { tap(message); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "OnRawMessage callback threw; continuing"); }
+                }
 
                 if (!message.TryGetProperty("type", out var typeElement))
                     continue;
@@ -250,24 +402,7 @@ internal class QueryHandler : IAsyncDisposable
 
                 if (msgType == "control_request")
                 {
-                    var reqId = message.TryGetProperty("request_id", out var ridElem)
-                        ? ridElem.GetString()
-                        : null;
-                    if (reqId != null && !_closed)
-                    {
-                        var cts = new CancellationTokenSource();
-                        await _lock.WaitAsync(CancellationToken.None);
-                        try
-                        {
-                            _inflightRequests[reqId] = cts;
-                        }
-                        finally
-                        {
-                            _lock.Release();
-                        }
-
-                        _ = HandleControlRequestAsync(message, reqId, cts);
-                    }
+                    await DispatchInboundControlRequestAsync(message);
                     continue;
                 }
 
@@ -296,6 +431,10 @@ internal class QueryHandler : IAsyncDisposable
                     continue;
                 }
 
+                // TS drops keep_alive frames before they reach the stream.
+                if (msgType == "keep_alive")
+                    continue;
+
                 if (msgType == "transcript_mirror")
                 {
                     // Python commit 6e3d54f: peel mirror frames off stdout and
@@ -307,10 +446,45 @@ internal class QueryHandler : IAsyncDisposable
                     continue;
                 }
 
+                var subtype = message.TryGetProperty("subtype", out var sst) && sst.ValueKind == JsonValueKind.String
+                    ? sst.GetString()
+                    : null;
+
                 // Track task lifecycle frames so results can tell "one turn
                 // ended" apart from "the run is done" (Python #1088).
                 if (msgType == "system")
+                {
+                    bool hadTasksInFlight;
+                    bool hasTasksInFlight;
+                    lock (_inflightTasks) hadTasksInFlight = _inflightTasks.Count > 0;
                     TrackTaskLifecycle(message);
+                    lock (_inflightTasks) hasTasksInFlight = _inflightTasks.Count > 0;
+                    if (hadTasksInFlight && !hasTasksInFlight)
+                    {
+                        // The ceiling left the last tracked agent alone; the
+                        // wait between turns starts over now that it settled.
+                        lock (_runLock) RearmRunEndCeilingBetweenTurns();
+                    }
+
+                    if (subtype == "commands_changed" &&
+                        message.TryGetProperty("commands", out var cmds) &&
+                        cmds.ValueKind == JsonValueKind.Array)
+                        _latestCommands = cmds.Clone();
+
+                    if (subtype == "session_state_changed")
+                    {
+                        var state = message.TryGetProperty("state", out var st) && st.ValueKind == JsonValueKind.String
+                            ? st.GetString()
+                            : null;
+                        lock (_runLock) OnSessionState(state);
+                        // Frames the CLI sent only because the transport asked
+                        // for them (CLAUDE_CODE_SDK_READS_SESSION_STATE); the
+                        // caller did not opt in.
+                        if (message.TryGetProperty("sdk_host_only", out var hostOnly) &&
+                            hostOnly.ValueKind == JsonValueKind.True)
+                            continue;
+                    }
+                }
 
                 // Track results for proper stream closure
                 if (msgType == "result")
@@ -320,12 +494,19 @@ internal class QueryHandler : IAsyncDisposable
                     if (_transcriptMirrorBatcher != null)
                         await _transcriptMirrorBatcher.FlushAsync(CancellationToken.None);
 
-                    // Background tasks still running may need control responses
-                    // over stdin; a later result (with none in flight) closes it.
-                    bool anyInflight;
-                    lock (_inflightTasks) anyInflight = _inflightTasks.Count > 0;
-                    if (!anyInflight)
-                        _firstResultEvent.TrySetResult();
+                    lock (_runLock)
+                    {
+                        _resultReceived = true;
+                        _turnInProgress = false;
+                        // A result ends a turn, not necessarily the run: a CLI
+                        // that reports session state stays "running" while a
+                        // follow-up turn is owed, so wait for "idle". Without
+                        // state events the result is all there is to go on.
+                        if (_sessionState is null or "idle" || !HasBidirectionalNeeds())
+                            MaybeEndRun();
+                        else if (_sessionState != "requires_action")
+                            ArmRunEndCeiling();
+                    }
 
                     // Python commit 9aafd84: remember the error text from the
                     // result, then suppress the trailing ProcessError below.
@@ -334,14 +515,25 @@ internal class QueryHandler : IAsyncDisposable
                             ? message.Clone()
                             : null;
                 }
-                else if (!(msgType == "system" &&
-                           message.TryGetProperty("subtype", out var sst) &&
-                           sst.ValueKind == JsonValueKind.String &&
-                           sst.GetString() == "session_state_changed"))
+                else if (!(msgType == "system" && subtype == "session_state_changed"))
                 {
                     // Anything other than the post-turn session_state_changed marker
                     // means the conversation moved on; reset the suppression marker.
                     _lastErrorResult = null;
+
+                    // A main-thread turn is under way, so the ceiling stops and
+                    // the run reopens even if the ceiling ended it.
+                    if (msgType is "assistant" or "stream_event" &&
+                        (!message.TryGetProperty("parent_tool_use_id", out var ptu) ||
+                         ptu.ValueKind == JsonValueKind.Null))
+                    {
+                        lock (_runLock)
+                        {
+                            _turnInProgress = true;
+                            ReopenRun();
+                            ClearRunEndCeiling();
+                        }
+                    }
                 }
 
                 // Regular SDK messages go to the stream
@@ -370,9 +562,9 @@ internal class QueryHandler : IAsyncDisposable
             await _lock.WaitAsync(CancellationToken.None);
             try
             {
-                foreach (var (_, tcs) in _pendingRequests)
+                foreach (var (_, pending) in _pendingRequests)
                 {
-                    tcs.TrySetException(finalEx);
+                    pending.Tcs.TrySetException(finalEx);
                 }
             }
             finally
@@ -388,9 +580,13 @@ internal class QueryHandler : IAsyncDisposable
             {
                 try { await _transcriptMirrorBatcher.FlushAsync(CancellationToken.None); } catch { }
             }
-            // Unblock any waiters (e.g. string-prompt path waiting for first result)
-            // so they don't stall on early exit.
-            _firstResultEvent.TrySetResult();
+            // Unblock any waiters (e.g. string-prompt path waiting for the end
+            // of the run) so they don't stall on early exit.
+            lock (_runLock)
+            {
+                _runFinal = true;
+                EndRun();
+            }
             // Python commit 9aafd84 (port): propagate the fatal exception through
             // the message channel so ReceiveMessagesAsync re-throws it for the
             // consumer instead of silently completing.
@@ -399,6 +595,41 @@ internal class QueryHandler : IAsyncDisposable
             else
                 _messageChannel.Writer.TryComplete();
         }
+    }
+
+    /// <summary>
+    /// Start handling an inbound control request, unless a request with the same
+    /// id is still in flight (TS: duplicate deliveries are skipped, which matters
+    /// when <c>reinitialize</c> redelivers pending permission prompts).
+    /// </summary>
+    private async Task DispatchInboundControlRequestAsync(JsonElement message)
+    {
+        var reqId = message.TryGetProperty("request_id", out var ridElem) && ridElem.ValueKind == JsonValueKind.String
+            ? ridElem.GetString()
+            : null;
+        if (reqId == null || _closed)
+            return;
+
+        var cts = new CancellationTokenSource();
+        bool added;
+        await _lock.WaitAsync(CancellationToken.None);
+        try
+        {
+            added = _inflightRequests.TryAdd(reqId, cts);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+
+        if (!added)
+        {
+            _logger.LogDebug("Duplicate delivery of in-flight control request {RequestId}; skipping", reqId);
+            cts.Dispose();
+            return;
+        }
+
+        _ = HandleControlRequestAsync(message, reqId, cts);
     }
 
     private void EnqueueTranscriptMirror(JsonElement message)
@@ -469,7 +700,9 @@ internal class QueryHandler : IAsyncDisposable
             await _lock.WaitAsync(CancellationToken.None);
             try
             {
-                _inflightRequests.Remove(requestId);
+                // Only remove our own entry (a cancel may already have removed it).
+                if (_inflightRequests.TryGetValue(requestId, out var current) && ReferenceEquals(current, cts))
+                    _inflightRequests.Remove(requestId);
             }
             finally
             {
@@ -491,28 +724,34 @@ internal class QueryHandler : IAsyncDisposable
         if (requestId == null)
             return;
 
+        string? subtype = null;
+        var matched = false;
+        var success = false;
         await _lock.WaitAsync();
         try
         {
-            if (_pendingRequests.TryGetValue(requestId, out var tcs))
+            if (_pendingRequests.TryGetValue(requestId, out var pending))
             {
+                matched = true;
+                subtype = pending.Subtype;
                 if (response.TryGetProperty("subtype", out var subtypeElement) &&
                     subtypeElement.GetString() == "error")
                 {
                     var errorMsg = response.TryGetProperty("error", out var e)
                         ? e.GetString() ?? "Unknown error"
                         : "Unknown error";
-                    tcs.TrySetException(new ClaudeSDKException(errorMsg));
+                    pending.Tcs.TrySetException(new ClaudeSDKException(errorMsg));
                 }
                 else
                 {
+                    success = true;
                     // Python returns the inner `response` payload (or {}), not
                     // the {subtype, request_id, response} envelope.
                     var payload = response.TryGetProperty("response", out var inner) &&
                                   inner.ValueKind == JsonValueKind.Object
                         ? inner.Clone()
                         : SdkJson.EmptyObject();
-                    tcs.TrySetResult(payload);
+                    pending.Tcs.TrySetResult(payload);
                 }
             }
         }
@@ -520,7 +759,52 @@ internal class QueryHandler : IAsyncDisposable
         {
             _lock.Release();
         }
+
+        if (!matched || !success)
+            return;
+
+        // TS: prompt-redelivery fields are honored only on initialize responses.
+        var hasPermissions = response.TryGetProperty("pending_permission_requests", out var perms) &&
+                             perms.ValueKind == JsonValueKind.Array;
+        var hasDialogs = response.TryGetProperty("pending_user_dialog_requests", out var dialogs) &&
+                         dialogs.ValueKind == JsonValueKind.Array;
+        if (!hasPermissions && !hasDialogs)
+            return;
+        if (subtype != "initialize")
+        {
+            _logger.LogDebug("Ignoring prompt-redelivery fields on non-initialize response ({Subtype})", subtype);
+            return;
+        }
+
+        if (hasPermissions)
+            await RedeliverAsync(perms, "can_use_tool");
+        if (hasDialogs)
+            await RedeliverAsync(dialogs, "request_user_dialog");
     }
+
+    private async Task RedeliverAsync(JsonElement requests, string subtype)
+    {
+        foreach (var req in requests.EnumerateArray())
+        {
+            if (req.ValueKind == JsonValueKind.Object &&
+                req.TryGetProperty("request", out var body) &&
+                body.ValueKind == JsonValueKind.Object &&
+                body.TryGetProperty("subtype", out var st) &&
+                st.ValueKind == JsonValueKind.String &&
+                st.GetString() == subtype)
+            {
+                await DispatchInboundControlRequestAsync(req.Clone());
+            }
+        }
+    }
+
+    /// <summary>Returned by an inbound handler to write no response at all.</summary>
+    private static readonly object SuppressResponse = new();
+
+    // TS DG: requests for the machine serving this session's tools; another
+    // host answers them, so this SDK stays silent.
+    private static readonly HashSet<string> SilentSubtypes =
+        ["remote_tool_call", "remote_plumbing_call", "remote_tools_probe", "remote_tools_reannounce"];
 
     private async Task HandleControlRequestInnerAsync(JsonElement message, CancellationToken cancellationToken)
     {
@@ -529,17 +813,24 @@ internal class QueryHandler : IAsyncDisposable
             return;
 
         var requestId = requestIdElement.GetString()!;
-        var subtype = request.GetProperty("subtype").GetString();
+        var subtype = request.TryGetProperty("subtype", out var stElem) ? stElem.GetString() : null;
         _logger.LogDebug("Control request {Subtype} ({RequestId}) from CLI", subtype, requestId);
+
+        if (subtype != null && SilentSubtypes.Contains(subtype))
+        {
+            _logger.LogDebug("{Subtype} {RequestId} is for the machine serving this session's tools; leaving it unanswered", subtype, requestId);
+            return;
+        }
 
         try
         {
             object? responseData = null;
+            var context = new ControlRequestContext(requestId);
 
             switch (subtype)
             {
                 case "can_use_tool":
-                    responseData = await HandleCanUseToolAsync(request, cancellationToken);
+                    responseData = await HandleCanUseToolAsync(request, requestId, cancellationToken);
                     break;
 
                 case "hook_callback":
@@ -550,9 +841,28 @@ internal class QueryHandler : IAsyncDisposable
                     responseData = await HandleMcpMessageAsync(request, cancellationToken);
                     break;
 
+                case "elicitation":
+                    responseData = await HandleElicitationAsync(request, context, cancellationToken);
+                    break;
+
+                case "request_user_dialog":
+                    responseData = await HandleUserDialogAsync(request, context, cancellationToken);
+                    break;
+
+                case "oauth_token_refresh":
+                    responseData = await HandleOAuthTokenRefreshAsync(cancellationToken);
+                    break;
+
+                case "host_auth_token_refresh":
+                    responseData = await HandleHostAuthTokenRefreshAsync(cancellationToken);
+                    break;
+
                 default:
                     throw new ClaudeSDKException($"Unsupported control request subtype: {subtype}");
             }
+
+            if (ReferenceEquals(responseData, SuppressResponse))
+                return;
 
             // Send success response
             var successResponse = new Dictionary<string, object?>
@@ -604,7 +914,7 @@ internal class QueryHandler : IAsyncDisposable
         }
     }
 
-    private async Task<object> HandleCanUseToolAsync(JsonElement request, CancellationToken cancellationToken)
+    private async Task<object> HandleCanUseToolAsync(JsonElement request, string requestId, CancellationToken cancellationToken)
     {
         if (_options.CanUseTool == null)
             throw new ClaudeSDKException("canUseTool callback is not provided");
@@ -619,20 +929,43 @@ internal class QueryHandler : IAsyncDisposable
                 .ToList()
             : new List<PermissionUpdate>();
 
-        string? Opt(string name) =>
-            request.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() : null;
-
+        var toolUseId = OptString(request, "tool_use_id");
         var context = new ToolPermissionContext(
             Signal: null,
             Suggestions: suggestions,
-            ToolUseId: Opt("tool_use_id"),
-            AgentId: Opt("agent_id"),
-            BlockedPath: Opt("blocked_path"),
-            DecisionReason: Opt("decision_reason"),
-            Title: Opt("title"),
-            DisplayName: Opt("display_name"),
-            Description: Opt("description"));
+            ToolUseId: toolUseId,
+            AgentId: OptString(request, "agent_id"),
+            BlockedPath: OptString(request, "blocked_path"),
+            DecisionReason: OptString(request, "decision_reason"),
+            Title: OptString(request, "title"),
+            DisplayName: OptString(request, "display_name"),
+            Description: OptString(request, "description"))
+        {
+            RequestId = requestId,
+            McpServer = request.TryGetProperty("mcp_server", out var ms) && ms.ValueKind == JsonValueKind.Object
+                ? new McpServerProvenance(OptString(ms, "name"), OptString(ms, "source"))
+                : null,
+            DefaultToNo = OptBool(request, "default_to_no"),
+            SuppressAlwaysAllowRule = OptBool(request, "suppress_always_allow_rule"),
+            MatchedAskRule = request.TryGetProperty("matched_ask_rule", out var mar) && mar.ValueKind == JsonValueKind.Object
+                ? new MatchedAskRule(OptString(mar, "source"), OptString(mar, "tool_name"), OptString(mar, "rule_content"))
+                : null,
+            RequiresUserInteraction = OptBool(request, "requires_user_interaction"),
+            DecisionReasonType = OptString(request, "decision_reason_type"),
+            ClassifierApprovable = OptBool(request, "classifier_approvable"),
+            ServerPrompt = OptString(request, "server_prompt"),
+            ComputerFolder = request.TryGetProperty("computer_folder", out var cf) &&
+                             cf.ValueKind == JsonValueKind.Object &&
+                             OptString(cf, "path") is { } cfPath &&
+                             OptString(cf, "computer_name") is { } cfName
+                ? new ComputerFolder(cfPath, cfName)
+                : null
+        };
         var result = await _options.CanUseTool(toolName, input, context, cancellationToken);
+
+        // TS: a null result means the host answered out-of-band; write nothing.
+        if (result is null)
+            return SuppressResponse;
 
         if (result is PermissionResultAllow allow)
         {
@@ -651,6 +984,12 @@ internal class QueryHandler : IAsyncDisposable
                     .ToList();
             }
 
+            if (allow.DecisionClassification is { } dc)
+                response["decisionClassification"] = dc.ToWire();
+            // TS spreads the result then sets toolUseID from the request.
+            if ((toolUseId ?? allow.ToolUseId) is { } echo)
+                response["toolUseID"] = echo;
+
             return response;
         }
         else if (result is PermissionResultDeny deny)
@@ -663,12 +1002,27 @@ internal class QueryHandler : IAsyncDisposable
 
             if (deny.Interrupt)
                 response["interrupt"] = true;
+            if (deny.DecisionClassification is { } dc)
+                response["decisionClassification"] = dc.ToWire();
+            if ((toolUseId ?? deny.ToolUseId) is { } echo)
+                response["toolUseID"] = echo;
 
             return response;
         }
 
         throw new ClaudeSDKException($"Invalid permission result type: {result.GetType().Name}");
     }
+
+    private static string? OptString(JsonElement e, string name) =>
+        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String
+            ? v.GetString()
+            : null;
+
+    private static bool? OptBool(JsonElement e, string name) =>
+        e.ValueKind == JsonValueKind.Object && e.TryGetProperty(name, out var v) &&
+        v.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? v.GetBoolean()
+            : null;
 
     private async Task<object> HandleHookCallbackAsync(JsonElement request, CancellationToken cancellationToken)
     {
@@ -809,44 +1163,80 @@ internal class QueryHandler : IAsyncDisposable
         _sdkMcpBridges[serverName] = bridge;
     }
 
-    private async Task<JsonElement> SendControlRequestAsync(
+    /// <summary>
+    /// Send an SDK-initiated control request and return the inner response
+    /// payload.
+    /// </summary>
+    /// <remarks>
+    /// <para>Cancelling <paramref name="cancellationToken"/> before the request is
+    /// written sends nothing; cancelling after it was written also sends
+    /// <c>{"type":"control_cancel_request","request_id":...}</c> so the CLI can
+    /// abandon it (TS parity). Both throw <see cref="OperationCanceledException"/>.</para>
+    /// <para>Only a real timeout raises <c>ClaudeSDKException("Control request timeout: ...")</c>.</para>
+    /// </remarks>
+    internal async Task<JsonElement> SendControlRequestAsync(
         Dictionary<string, object?> request,
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
+        var subtype = request.GetValueOrDefault("subtype") as string;
+        cancellationToken.ThrowIfCancellationRequested();
+
         var requestId = $"req_{Interlocked.Increment(ref _requestCounter)}_{Guid.NewGuid():N}";
-        _logger.LogDebug("Sending control request {Subtype} ({RequestId})", request.GetValueOrDefault("subtype"), requestId);
+        _logger.LogDebug("Sending control request {Subtype} ({RequestId})", subtype, requestId);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
 
         await _lock.WaitAsync(cancellationToken);
         try
         {
-            _pendingRequests[requestId] = tcs;
+            _pendingRequests[requestId] = new PendingRequest(tcs, subtype);
         }
         finally
         {
             _lock.Release();
         }
 
-        var controlRequest = new Dictionary<string, object?>
-        {
-            ["type"] = "control_request",
-            ["request_id"] = requestId,
-            ["request"] = request
-        };
-
-        await _transport.WriteAsync(SdkJson.Serialize(controlRequest) + "\n", cancellationToken);
-
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        cts.CancelAfter(timeout);
-
+        var written = false;
         try
         {
-            return await tcs.Task.WaitAsync(cts.Token);
+            var controlRequest = new Dictionary<string, object?>
+            {
+                ["type"] = "control_request",
+                ["request_id"] = requestId,
+                ["request"] = request
+            };
+
+            cancellationToken.ThrowIfCancellationRequested();
+            // Never cancel mid-write: a torn line would break the transport for
+            // every later write. Cancellation is honored before and after.
+            await _transport.WriteAsync(SdkJson.Serialize(controlRequest) + "\n", CancellationToken.None);
+            written = true;
+
+            return await tcs.Task.WaitAsync(timeout, cancellationToken);
         }
-        catch (OperationCanceledException)
+        catch (TimeoutException)
         {
-            throw new ClaudeSDKException($"Control request timeout: {request.GetValueOrDefault("subtype")}");
+            throw new ClaudeSDKException($"Control request timeout: {subtype}");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            if (written)
+            {
+                try
+                {
+                    var cancel = new Dictionary<string, object?>
+                    {
+                        ["type"] = "control_cancel_request",
+                        ["request_id"] = requestId
+                    };
+                    await _transport.WriteAsync(SdkJson.Serialize(cancel) + "\n", CancellationToken.None);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogDebug(ex, "Failed to write control_cancel_request for {RequestId}", requestId);
+                }
+            }
+            throw;
         }
         finally
         {
@@ -863,15 +1253,40 @@ internal class QueryHandler : IAsyncDisposable
     }
 
     /// <summary>
+    /// Write an SDK-originated MCP message (a notification such as
+    /// <c>notifications/tools/list_changed</c>, or a request) from an in-process
+    /// server to the CLI: <c>control_request/mcp_message</c> with a fresh id.
+    /// Fire-and-forget like TS <c>sendMcpServerMessageToCli</c>: the CLI's
+    /// acknowledgement is not awaited.
+    /// </summary>
+    internal async Task SendMcpServerMessageAsync(string serverName, JsonElement message, CancellationToken cancellationToken)
+    {
+        var frame = new Dictionary<string, object?>
+        {
+            ["type"] = "control_request",
+            ["request_id"] = Guid.NewGuid().ToString(),
+            ["request"] = new Dictionary<string, object?>
+            {
+                ["subtype"] = "mcp_message",
+                ["server_name"] = serverName,
+                ["message"] = message
+            }
+        };
+        cancellationToken.ThrowIfCancellationRequested();
+        await _transport.WriteAsync(SdkJson.Serialize(frame) + "\n", CancellationToken.None);
+    }
+
+    private static readonly TimeSpan DefaultControlTimeout = TimeSpan.FromSeconds(60);
+
+    private Task<JsonElement> SendAsync(Dictionary<string, object?> request, CancellationToken cancellationToken) =>
+        SendControlRequestAsync(request, DefaultControlTimeout, cancellationToken);
+
+    /// <summary>
     /// Send interrupt control request.
     /// </summary>
     public async Task InterruptAsync(CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
-            new Dictionary<string, object?> { ["subtype"] = "interrupt" },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+        await SendAsync(new Dictionary<string, object?> { ["subtype"] = "interrupt" }, cancellationToken);
     }
 
     /// <summary>
@@ -879,11 +1294,9 @@ internal class QueryHandler : IAsyncDisposable
     /// </summary>
     public async Task SetPermissionModeAsync(string mode, CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
+        await SendAsync(
             new Dictionary<string, object?> { ["subtype"] = "set_permission_mode", ["mode"] = mode },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+            cancellationToken);
     }
 
     /// <summary>
@@ -891,11 +1304,9 @@ internal class QueryHandler : IAsyncDisposable
     /// </summary>
     public async Task SetModelAsync(string? model, CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
+        await SendAsync(
             new Dictionary<string, object?> { ["subtype"] = "set_model", ["model"] = model },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+            cancellationToken);
     }
 
     /// <summary>
@@ -903,91 +1314,85 @@ internal class QueryHandler : IAsyncDisposable
     /// </summary>
     public async Task RewindFilesAsync(string userMessageId, CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
+        await SendAsync(
             new Dictionary<string, object?> { ["subtype"] = "rewind_files", ["user_message_id"] = userMessageId },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+            cancellationToken);
     }
 
     /// <summary>
     /// Get the current MCP server status.
     /// </summary>
-    public async Task<JsonElement> GetMcpStatusAsync(CancellationToken cancellationToken = default)
-    {
-        return await SendControlRequestAsync(
-            new Dictionary<string, object?> { ["subtype"] = "mcp_status" },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
-    }
+    public Task<JsonElement> GetMcpStatusAsync(CancellationToken cancellationToken = default) =>
+        SendAsync(new Dictionary<string, object?> { ["subtype"] = "mcp_status" }, cancellationToken);
 
     /// <summary>
     /// Get a breakdown of current context window usage. Python commit ac900bd.
     /// </summary>
-    public async Task<JsonElement> GetContextUsageAsync(CancellationToken cancellationToken = default)
-    {
-        return await SendControlRequestAsync(
-            new Dictionary<string, object?> { ["subtype"] = "get_context_usage" },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
-    }
+    public Task<JsonElement> GetContextUsageAsync(CancellationToken cancellationToken = default) =>
+        SendAsync(new Dictionary<string, object?> { ["subtype"] = "get_context_usage" }, cancellationToken);
 
     /// <summary>Reconnect a disconnected or failed MCP server. Python commit 28f9b4b.</summary>
     public async Task ReconnectMcpServerAsync(string serverName, CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
+        await SendAsync(
             new Dictionary<string, object?> { ["subtype"] = "mcp_reconnect", ["serverName"] = serverName },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+            cancellationToken);
     }
 
     /// <summary>Enable or disable an MCP server. Python commit 28f9b4b.</summary>
     public async Task ToggleMcpServerAsync(string serverName, bool enabled, CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
+        await SendAsync(
             new Dictionary<string, object?> { ["subtype"] = "mcp_toggle", ["serverName"] = serverName, ["enabled"] = enabled },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+            cancellationToken);
     }
 
     /// <summary>Stop a running task. Python commit 28f9b4b.</summary>
     public async Task StopTaskAsync(string taskId, CancellationToken cancellationToken = default)
     {
-        await SendControlRequestAsync(
+        await SendAsync(
             new Dictionary<string, object?> { ["subtype"] = "stop_task", ["task_id"] = taskId },
-            TimeSpan.FromSeconds(60),
-            cancellationToken
-        );
+            cancellationToken);
     }
 
     /// <summary>
     /// Whether the CLI may still send control requests that need a reply
-    /// (SDK MCP servers, hooks, or a can_use_tool callback). Closing stdin while
-    /// any are configured makes later requests fail CLI-side with "Stream closed".
+    /// (SDK MCP servers, hooks, can_use_tool, and the TS callbacks: elicitation,
+    /// user dialogs, OAuth / host-auth refresh). Closing stdin while any are
+    /// configured makes later requests fail CLI-side with "Stream closed".
     /// </summary>
     private bool HasBidirectionalNeeds() =>
-        _sdkMcpBridges.Count > 0 ||
+        !_sdkMcpBridges.IsEmpty ||
         (_options.Hooks != null && _options.Hooks.Count > 0) ||
-        _options.CanUseTool != null;
+        _options.CanUseTool != null ||
+        _options.OnElicitation != null ||
+        _options.OnUserDialog != null ||
+        _options.GetOAuthToken != null ||
+        _options.GetHostAuthToken != null;
 
     /// <summary>
-    /// Wait for the run-ending result (if bidirectional needs exist) then close
-    /// stdin. No timeout: the control protocol needs stdin for the whole run,
-    /// and the read loop always releases the wait on exit. Python:
+    /// Wait for the end of the run (if bidirectional needs exist) then close
+    /// stdin. The run ends at the CLI's <c>idle</c> session state after a
+    /// result or, from a CLI that reports no session state, at the first result
+    /// with no tracked tasks in flight; the between-turns wait is bounded by
+    /// <c>CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS</c>. Python:
     /// <c>wait_for_result_and_end_input</c>.
     /// </summary>
     public async Task WaitForResultAndEndInputAsync(CancellationToken cancellationToken = default)
     {
         if (HasBidirectionalNeeds())
         {
-            try { await _firstResultEvent.Task.WaitAsync(cancellationToken); }
+            Task runEnded;
+            lock (_runLock) runEnded = _runEnded.Task;
+            try { await runEnded.WaitAsync(cancellationToken); }
             catch (OperationCanceledException) { }
         }
 
+        lock (_runLock)
+        {
+            _runFinal = true;
+            ClearRunEndCeiling();
+        }
         await _transport.EndInputAsync(CancellationToken.None);
     }
 
@@ -1007,6 +1412,8 @@ internal class QueryHandler : IAsyncDisposable
 
     /// <summary>
     /// Stream input messages to transport, then close stdin once the run ends.
+    /// Each prompt owes a run of its own, so the wait is for the last prompt's
+    /// run, not an earlier one's.
     /// </summary>
     public async Task StreamInputAsync(
         IAsyncEnumerable<Dictionary<string, object?>> stream,
@@ -1019,6 +1426,12 @@ internal class QueryHandler : IAsyncDisposable
             {
                 if (_closed)
                     break;
+                lock (_runLock)
+                {
+                    ReopenRun();
+                    _resultReceived = false;
+                    ClearRunEndCeiling();
+                }
                 await _transport.WriteAsync(
                     SdkJson.Serialize(StampUserMessage(message, _options.VerbatimPrompts)) + "\n",
                     cancellationToken);
@@ -1036,10 +1449,15 @@ internal class QueryHandler : IAsyncDisposable
         try
         {
             if (written > 0)
+            {
                 await WaitForResultAndEndInputAsync(cancellationToken);
+            }
             else
+            {
                 // Nothing was sent, so no result will arrive to release the hold.
+                lock (_runLock) _runFinal = true;
                 await _transport.EndInputAsync(CancellationToken.None);
+            }
         }
         catch (Exception ex)
         {
@@ -1072,6 +1490,7 @@ internal class QueryHandler : IAsyncDisposable
             return;
 
         _closed = true;
+        lock (_runLock) ClearRunEndCeiling();
 
         var readCts = Interlocked.Exchange(ref _readCts, null);
         if (readCts != null)
@@ -1120,4 +1539,158 @@ internal class QueryHandler : IAsyncDisposable
 
         _lock.Dispose();
     }
+
+    #region Run lifecycle (Python 0.2.160 session-state handshake, #1088 / #1190)
+
+    // The CLI's own wait for background work once stdin is closed; the SDK
+    // bounds its wait for "idle" by the same value.
+    internal const string RunEndCeilingEnv = "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS";
+    internal const int DefaultRunEndCeilingMs = 600_000;
+
+    private readonly object _runLock = new();
+    private readonly int _runEndCeilingMs;
+    // Completed when the run is over, so the stdin-closing waiter can wake.
+    // Work the CLI takes up after the run ended swaps in a fresh one (ReopenRun).
+    private TaskCompletionSource _runEnded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _resultReceived;
+    // The CLI's latest session_state_changed state, or null while it sends
+    // none (a CLI too old to honor CLAUDE_CODE_SDK_READS_SESSION_STATE).
+    private string? _sessionState;
+    // A main-thread turn is under way: the ceiling counts only the wait
+    // between turns, so it is not armed meanwhile.
+    private bool _turnInProgress;
+    // Set once stdin is closed or the reader is gone: the run stays ended.
+    private bool _runFinal;
+    private int _runEndCeilingGeneration;
+    private CancellationTokenSource? _runEndCeilingCts;
+
+    /// <summary>
+    /// Read <c>CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS</c> as the CLI will see it:
+    /// <paramref name="optionsEnv"/> overrides the inherited environment. 0 means
+    /// no limit; anything that is not a non-negative integer falls back to 10
+    /// minutes. Python: <c>run_end_ceiling_ms</c>.
+    /// </summary>
+    internal static int RunEndCeilingMs(IReadOnlyDictionary<string, string> optionsEnv)
+    {
+        var raw = optionsEnv.TryGetValue(RunEndCeilingEnv, out var v)
+            ? v
+            : Environment.GetEnvironmentVariable(RunEndCeilingEnv);
+        if (raw is null)
+            return DefaultRunEndCeilingMs;
+        if (!long.TryParse(raw.Trim().Replace("_", ""), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var value))
+            return DefaultRunEndCeilingMs;
+        if (value < 0)
+            return DefaultRunEndCeilingMs;
+        return (int)Math.Min(value, int.MaxValue);
+    }
+
+    // All members below require _runLock.
+
+    private void OnSessionState(string? state)
+    {
+        _sessionState = state;
+        if (state == "idle")
+        {
+            if (_resultReceived)
+                MaybeEndRun();
+            return;
+        }
+        // Work the CLI took up after the run ended (a finished background task
+        // woke it) reopens the run until the next "idle".
+        ReopenRun();
+        if (state == "requires_action")
+            ClearRunEndCeiling(); // the host is answering a request; stdin must outlast it
+        else
+            RearmRunEndCeilingBetweenTurns();
+    }
+
+    private void MaybeEndRun()
+    {
+        bool anyInflight;
+        lock (_inflightTasks) anyInflight = _inflightTasks.Count > 0;
+        if (anyInflight)
+        {
+            _logger.LogDebug("Turn ended with task(s) in flight; keeping stdin open");
+            return;
+        }
+        EndRun();
+    }
+
+    private void EndRun()
+    {
+        ClearRunEndCeiling();
+        _runEnded.TrySetResult();
+    }
+
+    private void ReopenRun()
+    {
+        if (_runEnded.Task.IsCompleted && !_runFinal)
+            _runEnded = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    private void ArmRunEndCeiling()
+    {
+        ClearRunEndCeiling();
+        if (_runEndCeilingMs <= 0 ||
+            _runEnded.Task.IsCompleted ||
+            _runFinal ||
+            _closed ||
+            _turnInProgress ||
+            !HasBidirectionalNeeds())
+            return;
+
+        var generation = _runEndCeilingGeneration;
+        var cts = new CancellationTokenSource();
+        _runEndCeilingCts = cts;
+        _ = EndRunAtCeilingAsync(generation, cts.Token);
+    }
+
+    private void RearmRunEndCeilingBetweenTurns()
+    {
+        if (_resultReceived && _sessionState is not (null or "idle" or "requires_action"))
+            ArmRunEndCeiling();
+    }
+
+    private async Task EndRunAtCeilingAsync(int generation, CancellationToken token)
+    {
+        try
+        {
+            await Task.Delay(_runEndCeilingMs, token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
+
+        lock (_runLock)
+        {
+            // Cleared or re-armed while this sleeper was already waking up.
+            if (generation != _runEndCeilingGeneration)
+                return;
+            _runEndCeilingCts = null;
+            bool anyInflight;
+            lock (_inflightTasks) anyInflight = _inflightTasks.Count > 0;
+            if (anyInflight)
+            {
+                _logger.LogDebug("No 'idle' {Ms}ms after the last result, but tracked task(s) still in flight; keeping stdin open", _runEndCeilingMs);
+                return;
+            }
+            _logger.LogDebug("No 'idle' {Ms}ms after the last result; ending the run", _runEndCeilingMs);
+            EndRun();
+        }
+    }
+
+    private void ClearRunEndCeiling()
+    {
+        _runEndCeilingGeneration++;
+        var cts = _runEndCeilingCts;
+        _runEndCeilingCts = null;
+        if (cts != null)
+        {
+            try { cts.Cancel(); } catch { }
+            cts.Dispose();
+        }
+    }
+
+    #endregion
 }

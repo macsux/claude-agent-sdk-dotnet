@@ -22,6 +22,12 @@ internal sealed class FakeTransport : ITransport
     /// <summary>Maps an SDK control request body to the inner response payload.</summary>
     public Func<JsonElement, object?> ControlResponder { get; set; } = _ => new Dictionary<string, object?>();
 
+    /// <summary>When true for a request body, the request is recorded but never answered.</summary>
+    public Func<JsonElement, bool>? HoldResponse { get; set; }
+
+    /// <summary>Extra members merged into the success envelope (e.g. <c>pending_permission_requests</c>).</summary>
+    public Func<JsonElement, Dictionary<string, object?>?>? EnvelopeExtras { get; set; }
+
     public bool IsReady => true;
 
     public void Send(object frame) => _incoming.Writer.TryWrite(JsonSerializer.SerializeToElement(frame));
@@ -40,16 +46,21 @@ internal sealed class FakeTransport : ITransport
 
             if (json.GetProperty("type").GetString() == "control_request")
             {
-                Send(new
+                var body = json.GetProperty("request");
+                if (HoldResponse?.Invoke(body) == true)
+                    continue;
+                var envelope = new Dictionary<string, object?>
                 {
-                    type = "control_response",
-                    response = new
-                    {
-                        subtype = "success",
-                        request_id = json.GetProperty("request_id").GetString(),
-                        response = ControlResponder(json.GetProperty("request"))
-                    }
-                });
+                    ["subtype"] = "success",
+                    ["request_id"] = json.GetProperty("request_id").GetString(),
+                    ["response"] = ControlResponder(body)
+                };
+                if (EnvelopeExtras?.Invoke(body) is { } extras)
+                {
+                    foreach (var (k, v) in extras)
+                        envelope[k] = v;
+                }
+                Send(new Dictionary<string, object?> { ["type"] = "control_response", ["response"] = envelope });
             }
         }
         return Task.CompletedTask;
@@ -75,6 +86,13 @@ internal sealed class FakeTransport : ITransport
     }
 
     public ValueTask DisposeAsync() => new(CloseAsync());
+
+    /// <summary>SDK-initiated control request bodies with the given subtype.</summary>
+    public List<JsonElement> RequestsOf(string subtype) => Written
+        .Where(w => w.GetProperty("type").GetString() == "control_request" &&
+                    w.GetProperty("request").GetProperty("subtype").GetString() == subtype)
+        .Select(w => w.GetProperty("request"))
+        .ToList();
 
     /// <summary>Control responses the SDK wrote for a CLI-initiated request id.</summary>
     public List<JsonElement> ResponsesFor(string requestId) => Written

@@ -41,6 +41,7 @@ public static partial class Claude
             var bridge = new SdkMcpBridge(sdkConfig.Handlers, name);
             await bridge.StartAsync(cancellationToken);
             queryHandler.RegisterSdkMcpBridge(name, bridge);
+            queryHandler.RecordSdkMcpTimeout(name, sdkConfig.Timeout);
         }
     }
 
@@ -151,6 +152,7 @@ public static partial class Claude
 
         // Fail fast on invalid SessionStore option combinations before spawning.
         SessionStoreValidation.Validate(options);
+        TsOptionsValidation.Validate(options);
 
         // resume/continue + SessionStore: load the session from the store into a
         // temp CLAUDE_CONFIG_DIR for the subprocess to resume from. Skipped for a

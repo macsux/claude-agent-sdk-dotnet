@@ -31,14 +31,17 @@ public static class ClaudeSessions
     /// <paramref name="directory"/>, lists that project (and, when
     /// <paramref name="includeWorktrees"/>, its git worktrees); otherwise all projects.
     /// Sorted by <see cref="SDKSessionInfo.LastModified"/> descending. Mirrors Python
-    /// <c>list_sessions</c>.
+    /// <c>list_sessions</c>. <paramref name="includeProgrammatic"/> false (TS-only)
+    /// hides programmatic sessions (SDK entrypoints, daemon workers), as terminal
+    /// <c>/resume</c> does.
     /// </summary>
     public static IReadOnlyList<SDKSessionInfo> ListSessions(
         string? directory = null,
         int? limit = null,
         int offset = 0,
-        bool includeWorktrees = true)
-        => SessionTranscripts.ListSessions(directory, limit, offset, includeWorktrees);
+        bool includeWorktrees = true,
+        bool includeProgrammatic = true)
+        => SessionTranscripts.ListSessions(directory, limit, offset, includeWorktrees, includeProgrammatic);
 
     /// <summary>
     /// Metadata for one session, or null if the id is invalid, the session is not found,
@@ -50,14 +53,16 @@ public static class ClaudeSessions
     /// <summary>
     /// A session's user/assistant messages in chronological order (conversation chain rebuilt
     /// via <c>parentUuid</c>). Empty if the id is invalid or the session is not found. Mirrors
-    /// Python <c>get_session_messages</c>.
+    /// Python <c>get_session_messages</c>. <paramref name="includeSystemMessages"/> (TS-only)
+    /// also returns system entries (compact boundaries, notices) with type <c>"system"</c>.
     /// </summary>
     public static IReadOnlyList<SessionMessage> GetSessionMessages(
         string sessionId,
         string? directory = null,
         int? limit = null,
-        int offset = 0)
-        => SessionTranscripts.GetSessionMessages(sessionId, directory, limit, offset);
+        int offset = 0,
+        bool includeSystemMessages = false)
+        => SessionTranscripts.GetSessionMessages(sessionId, directory, limit, offset, includeSystemMessages);
 
     /// <summary>
     /// Subagent ids of a session (from <c>&lt;session&gt;/subagents/**/agent-&lt;id&gt;.jsonl</c>).
@@ -289,19 +294,34 @@ public static class ClaudeSessions
     /// id is invalid or the session is not found. Mirrors Python
     /// <c>get_session_messages_from_store</c>.
     /// </summary>
-    public static async Task<IReadOnlyList<SessionMessage>> GetSessionMessagesAsync(
+    public static Task<IReadOnlyList<SessionMessage>> GetSessionMessagesAsync(
         ISessionStore store,
         string sessionId,
         string? directory = null,
         int? limit = null,
         int offset = 0,
         CancellationToken cancellationToken = default)
+        => GetSessionMessagesAsync(store, sessionId, directory, limit, offset, includeSystemMessages: false, cancellationToken);
+
+    /// <summary>
+    /// <see cref="GetSessionMessagesAsync(ISessionStore, string, string?, int?, int, CancellationToken)"/>
+    /// with the TS-only <paramref name="includeSystemMessages"/> switch.
+    /// </summary>
+    public static async Task<IReadOnlyList<SessionMessage>> GetSessionMessagesAsync(
+        ISessionStore store,
+        string sessionId,
+        string? directory,
+        int? limit,
+        int offset,
+        bool includeSystemMessages,
+        CancellationToken cancellationToken = default)
     {
         if (!SessionPaths.ValidateUuid(sessionId)) return Array.Empty<SessionMessage>();
         var projectKey = SessionPaths.ProjectKeyForDirectory(directory);
         var entries = await store.LoadAsync(new SessionKey { ProjectKey = projectKey, SessionId = sessionId }, cancellationToken).ConfigureAwait(false);
         if (entries is null || entries.Count == 0) return Array.Empty<SessionMessage>();
-        return SessionTranscripts.EntriesToSessionMessages(SessionTranscripts.FilterTranscriptEntries(entries), limit, offset);
+        return SessionTranscripts.EntriesToSessionMessages(
+            SessionTranscripts.FilterTranscriptEntries(entries), limit, offset, includeSystemMessages);
     }
 
     /// <summary>

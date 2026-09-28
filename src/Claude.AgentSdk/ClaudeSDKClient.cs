@@ -67,7 +67,7 @@ namespace Claude.AgentSdk;
 /// }
 /// </code>
 /// </example>
-public class ClaudeSDKClient : IAsyncDisposable
+public partial class ClaudeSDKClient : IAsyncDisposable
 {
     private readonly ClaudeAgentOptions _options;
     private readonly ITransport? _customTransport;
@@ -122,6 +122,7 @@ public class ClaudeSDKClient : IAsyncDisposable
     {
         // Fail fast on invalid SessionStore option combinations before spawning.
         SessionStoreValidation.Validate(_options);
+        TsOptionsValidation.Validate(_options);
 
         // resume/continue + SessionStore: materialize the stored session into a
         // temp CLAUDE_CONFIG_DIR (skipped for a custom transport), honoring
@@ -190,6 +191,7 @@ public class ClaudeSDKClient : IAsyncDisposable
             var bridge = new SdkMcpBridge(sdkConfig.Handlers, name);
             await bridge.StartAsync(cancellationToken);
             _queryHandler.RegisterSdkMcpBridge(name, bridge);
+            _queryHandler.RecordSdkMcpTimeout(name, sdkConfig.Timeout);
         }
     }
 
