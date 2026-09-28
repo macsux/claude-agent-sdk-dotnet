@@ -250,6 +250,22 @@ Tests: `TsControlParityTests`, `TsOptionsParityTests`.
 | `listSessions({includeProgrammatic})` (hides `sdk-cli`/`sdk-ts`/`sdk-py` entrypoints and daemon sessions) | `ClaudeSessions.ListSessions(…, includeProgrammatic)`; also hides `sdk-dotnet` | added |
 | `getSessionMessages({includeSystemMessages})` | `GetSessionMessages(…, includeSystemMessages)`, store overload of `GetSessionMessagesAsync` | added |
 
+### Live validation (CLI 2.1.283)
+
+`tests/Claude.AgentSdk.IntegrationTests/TsParityTests.cs` runs the features above against the real
+CLI. CLI behaviors found along the way (none needed an SDK change):
+
+- `SessionStart` hooks run at process start, before `initialize` registers SDK callbacks, so an SDK
+  `SessionStart` callback never fires. `PostToolBatch` and `UserPromptExpansion` (slash command) do.
+- The CLI declares no client capabilities to in-process SDK MCP servers, so an SDK server's
+  `elicitation/create` gets `Method not found`. A stdio server's elicitation during a tool call
+  reaches `OnElicitation` (default: `decline`); one sent outside a tool call is answered `cancel`
+  by the CLI itself.
+- `prompt_suggestion` is not sent on the first turn; it arrives after the second turn's `result`.
+- `update_settings` into `localSettings` fails when `--setting-sources` excludes `local`.
+- The CLI sends `command_lifecycle` frames (queued/cancelled) that are not in the TS 0.3.283 union;
+  they surface as `UnknownMessage`.
+
 ## Follow-ups
 
 1. ~~**Sessions**: non-positive `load_timeout_ms`~~ — resolved: `MaterializeResumeSessionAsync`

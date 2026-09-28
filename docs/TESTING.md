@@ -5,7 +5,7 @@ The SDK has two test categories.
 | | Unit (`tests/Claude.AgentSdk.Tests`) | Integration (`tests/Claude.AgentSdk.IntegrationTests`) |
 |---|---|---|
 | Talks to | fakes and recorded fixtures | the real `claude` CLI and the Anthropic API |
-| Cost | free | real money (about $0.20 for a full run on haiku) |
+| Cost | free | real money (about $0.30 for a full run on haiku) |
 | Speed | about 10 s | about 1 min (tests run 4 at a time) |
 | Deterministic | yes | no (model output varies) |
 | Runs by default | yes | no: every test is **skipped** unless you opt in |
@@ -61,6 +61,9 @@ Requirements: an installed, authenticated Claude Code CLI. The suite finds the C
 `CLAUDE_CLI_PATH`, then `PATH`, then `~/.local/bin/claude`. If no CLI is found, every test is
 skipped with a message saying so.
 
+Some tests (`TsParityTests.Elicitation_*`) start a small stdio MCP server with `python3`; without
+it they log and return.
+
 The tests assert protocol-level facts rather than exact model wording, for example:
 
 - a denied `Write` leaves no file on disk;
@@ -94,7 +97,7 @@ All of these live in `Infrastructure/IntegrationTestBase.cs`:
 
 Each test prints its cost and the running total to the test output. The per-test table and the
 total are written to `bin/<config>/net10.0/integration-costs.log` and to stderr when the test
-process exits. A full run costs about $0.20 on haiku and takes about 1 minute.
+process exits. A full run costs about $0.30 on haiku and takes about 1.5 minutes.
 
 ### Environment variables
 
