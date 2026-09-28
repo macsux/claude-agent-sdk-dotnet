@@ -60,7 +60,8 @@ try
     // ---- 2. CLI command line (the --settings / --mcp-config JSON) ------------------------
     var cmd = new SubprocessTransport("unused", options).BuildCommand();
     string Arg(string flag) => cmd[cmd.IndexOf(flag) + 1];
-    Check(Arg("--settings") == """{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"network":{"allowLocalBinding":true}}}""",
+    // failIfUnavailable: injected for an enabled sandbox (TS parity).
+    Check(Arg("--settings") == """{"sandbox":{"enabled":true,"autoAllowBashIfSandboxed":true,"network":{"allowLocalBinding":true},"failIfUnavailable":true}}""",
         $"--settings carries only the set sandbox members: {Arg("--settings")}");
     Check(Arg("--mcp-config") == """{"mcpServers":{"calc":{"type":"sdk","name":"calc"}}}""",
         $"--mcp-config strips the in-process handlers: {Arg("--mcp-config")}");
@@ -168,6 +169,23 @@ try
               status.McpServers[1].Status == McpServerConnectionStatus.NeedsAuth, "ListMcpServersAsync maps status strings");
         var usage = await client.GetContextUsageAsync();
         Check(usage.TotalTokens == 3000 && usage.Categories[0].Name == "System prompt", "GetContextUsageAsync");
+
+        // TS-parity control requests (typed payloads through SdkJsonContext).
+        var typedInit = await client.InitializationResultAsync();
+        Check(typedInit.OutputStyle == "default" && typedInit.Commands.Count == 0, "typed initialize result");
+        await client.ApplyFlagSettingsAsync(new Dictionary<string, object?> { ["model"] = null, ["effortLevel"] = "high" });
+        await client.SetMcpServersAsync(new Dictionary<string, object>
+        {
+            ["ext"] = new McpSSEServerConfig { Url = "https://x", Timeout = 1000, Tools = [new McpServerToolPolicy { Name = "t" }] }
+        });
+        string LastBody(string subtype) => transport.Written
+            .Last(w => w.GetProperty("type").GetString() == "control_request" &&
+                       w.GetProperty("request").GetProperty("subtype").GetString() == subtype)
+            .GetProperty("request").GetRawText();
+        Check(LastBody("apply_flag_settings") == """{"subtype":"apply_flag_settings","settings":{"model":null,"effortLevel":"high"}}""",
+            $"apply_flag_settings keeps nulls: {LastBody("apply_flag_settings")}");
+        Check(LastBody("mcp_set_servers") == """{"subtype":"mcp_set_servers","servers":{"ext":{"type":"sse","url":"https://x","tools":[{"name":"t"}],"timeout":1000}}}""",
+            $"mcp_set_servers serializes typed configs: {LastBody("mcp_set_servers")}");
 
         // Messages.
         await client.QueryAsync("hello");

@@ -428,6 +428,11 @@ public class SubprocessTransport : ITransport
         if (hasSettings && !hasSandbox)
             return _options.Settings;
 
+        // TS (CG): an enabled sandbox fails closed unless the caller opted out.
+        var sandbox = _options.Sandbox!;
+        if (sandbox.Enabled == true && sandbox.FailIfUnavailable is null)
+            sandbox = sandbox with { FailIfUnavailable = true };
+
         // Merge settings with sandbox
         var settingsObj = new Dictionary<string, object?>();
 
@@ -463,8 +468,7 @@ public class SubprocessTransport : ITransport
             }
         }
 
-        if (hasSandbox)
-            settingsObj["sandbox"] = _options.Sandbox;
+        settingsObj["sandbox"] = sandbox;
 
         return SdkJson.Serialize(settingsObj);
     }
@@ -500,6 +504,9 @@ public class SubprocessTransport : ITransport
                 break;
             case SystemPromptPreset { Append: { } append }:
                 cmd.AddRange(["--append-system-prompt", append]);
+                break;
+            case SystemPromptBlocks:
+                // No argv form: the blocks ride in the initialize request (TS parity).
                 break;
         }
 
@@ -541,8 +548,24 @@ public class SubprocessTransport : ITransport
         if (!string.IsNullOrEmpty(_options.Model))
             cmd.AddRange(["--model", _options.Model]);
 
+        // TS: main-thread agent.
+        if (!string.IsNullOrEmpty(_options.Agent))
+            cmd.AddRange(["--agent", _options.Agent]);
+
         if (!string.IsNullOrEmpty(_options.FallbackModel))
+        {
+            // TS rejects a fallback identical to the main model.
+            if (!string.IsNullOrEmpty(_options.Model) && _options.FallbackModel == _options.Model)
+                throw new ArgumentException(
+                    "Fallback model cannot be the same as the main model. Please specify a different model for FallbackModel.");
             cmd.AddRange(["--fallback-model", _options.FallbackModel]);
+        }
+
+        // TS: --debug-file takes precedence over --debug.
+        if (!string.IsNullOrEmpty(_options.DebugFile))
+            cmd.AddRange(["--debug-file", _options.DebugFile]);
+        else if (_options.Debug)
+            cmd.Add("--debug");
 
         if (_options.Betas.Count > 0)
             cmd.AddRange(["--betas", string.Join(",", _options.Betas)]);
@@ -554,8 +577,14 @@ public class SubprocessTransport : ITransport
         if (permissionPromptToolName != null)
             cmd.AddRange(["--permission-prompt-tool", permissionPromptToolName]);
 
+        if (_options.PermissionPrompts is { } prompts)
+            cmd.AddRange(["--permission-prompts", prompts == PermissionPromptsMode.Host ? "host" : "none"]);
+
         if (_options.PermissionMode.HasValue)
             cmd.AddRange(["--permission-mode", PermissionModeToCliValue(_options.PermissionMode.Value)]);
+
+        if (_options.AllowDangerouslySkipPermissions)
+            cmd.Add("--allow-dangerously-skip-permissions");
 
         if (_options.ContinueConversation)
             cmd.Add("--continue");
@@ -584,6 +613,24 @@ public class SubprocessTransport : ITransport
 
         foreach (var dir in _options.AddDirs)
             cmd.AddRange(["--add-dir", dir]);
+
+        // TS: equals form (worktree support: settings, .mcp.json and .claude
+        // come from the trusted root).
+        if (_options.ProjectConfigRoot != null)
+            cmd.Add($"--project-config-root={_options.ProjectConfigRoot}");
+
+        if (_options.ManagedSettings is { } managed)
+            cmd.AddRange(["--managed-settings",
+                managed.ValueKind == JsonValueKind.String ? managed.GetString()! : managed.GetRawText()]);
+
+        if (!_options.PersistSession)
+            cmd.Add("--no-session-persistence");
+
+        if (_options.Channels is { Count: > 0 } channels)
+        {
+            foreach (var channel in channels)
+                AddFlagValue(cmd, "channels", channel);
+        }
 
         // MCP servers. Python: `if self._options.mcp_servers:` -- an empty map
         // (or empty path) emits nothing.
@@ -666,25 +713,38 @@ public class SubprocessTransport : ITransport
             cmd.Add($"--setting-sources={string.Join(",", effectiveSettingSources)}");
         }
 
-        foreach (var plugin in _options.Plugins)
+        if (_options.PluginDelivery == PluginDelivery.Initialize && _options.Plugins.Count > 0)
         {
-            if (plugin.Type == "local")
-                cmd.AddRange(["--plugin-dir", plugin.Path]);
-            else
-                throw new ArgumentException($"Unsupported plugin type: {plugin.Type}"); // Python: ValueError
+            // TS pluginDelivery 'initialize': the plugins ride in the initialize
+            // request; the CLI waits for it before loading them.
+            foreach (var plugin in _options.Plugins)
+            {
+                if (plugin.Type != "local")
+                    throw new ArgumentException($"Unsupported plugin type: {plugin.Type}");
+            }
+            cmd.Add("--await-initialize");
+        }
+        else
+        {
+            foreach (var plugin in _options.Plugins)
+            {
+                if (plugin.Type == "local")
+                    cmd.AddRange([plugin.SkipMcpDiscovery == true ? "--plugin-dir-no-mcp" : "--plugin-dir", plugin.Path]);
+                else
+                    throw new ArgumentException($"Unsupported plugin type: {plugin.Type}"); // Python: ValueError
+            }
         }
 
-        foreach (var (flag, value) in _options.ExtraArgs)
+        // TS routes `workload` through the extra-args map.
+        var extraArgs = _options.Workload is { } workload
+            ? new Dictionary<string, string?>(_options.ExtraArgs) { ["workload"] = workload }
+            : _options.ExtraArgs;
+        foreach (var (flag, value) in extraArgs)
         {
             if (value == null)
                 cmd.Add($"--{flag}");
-            else if (value.StartsWith('-'))
-                // In the two-token form a dash-leading value is not bound to its
-                // flag when the CLI declares the option with an optional value --
-                // it parses as a separate flag instead. The equals form always binds.
-                cmd.Add($"--{flag}={value}");
             else
-                cmd.AddRange([$"--{flag}", value]);
+                AddFlagValue(cmd, flag, value);
         }
 
         // Python commit 6617b9e: emit `--thinking adaptive` / `--thinking disabled`
@@ -698,8 +758,12 @@ public class SubprocessTransport : ITransport
                 case ThinkingConfigAdaptive:
                     cmd.AddRange(["--thinking", "adaptive"]);
                     break;
-                case ThinkingConfigEnabled e:
-                    cmd.AddRange(["--max-thinking-tokens", e.BudgetTokens.ToString()]);
+                case ThinkingConfigEnabled { BudgetTokens: { } budget }:
+                    cmd.AddRange(["--max-thinking-tokens", budget.ToString(CultureInfo.InvariantCulture)]);
+                    break;
+                case ThinkingConfigEnabled:
+                    // TS: an enabled config without a budget means adaptive.
+                    cmd.AddRange(["--thinking", "adaptive"]);
                     break;
                 case ThinkingConfigDisabled:
                     cmd.AddRange(["--thinking", "disabled"]);
@@ -721,13 +785,8 @@ public class SubprocessTransport : ITransport
         if (_options.Effort.HasValue)
             cmd.AddRange(["--effort", _options.Effort.Value.ToJsonString()]);
 
-        if (_options.OutputFormat.HasValue &&
-            _options.OutputFormat.Value.TryGetProperty("type", out var typeElement) &&
-            typeElement.GetString() == "json_schema" &&
-            _options.OutputFormat.Value.TryGetProperty("schema", out var schema))
-        {
+        if (JsonSchemaOf(_options.OutputFormat) is { } schema)
             cmd.AddRange(["--json-schema", schema.GetRawText()]);
-        }
 
         // Always use streaming mode with stdin (matching Python/TypeScript SDKs).
         // The prompt is written to stdin as a user message, never placed on the
@@ -735,6 +794,35 @@ public class SubprocessTransport : ITransport
         cmd.AddRange(["--input-format", "stream-json"]);
 
         return cmd;
+    }
+
+    /// <summary>
+    /// The schema of a <c>{"type":"json_schema","schema":...}</c> output format,
+    /// or null. Sent as <c>--json-schema</c> and (TS parity) initialize <c>jsonSchema</c>.
+    /// </summary>
+    internal static JsonElement? JsonSchemaOf(JsonElement? outputFormat)
+    {
+        if (outputFormat is { ValueKind: JsonValueKind.Object } format &&
+            format.TryGetProperty("type", out var typeElement) &&
+            typeElement.ValueKind == JsonValueKind.String &&
+            typeElement.GetString() == "json_schema" &&
+            format.TryGetProperty("schema", out var schema))
+            return schema;
+        return null;
+    }
+
+    /// <summary>
+    /// <c>--flag value</c>, or <c>--flag=value</c> when the value starts with a
+    /// dash: in the two-token form a dash-leading value is not bound to its flag
+    /// when the CLI declares the option with an optional value -- it parses as
+    /// a separate flag instead. The equals form always binds. (TS: <c>Kx</c>.)
+    /// </summary>
+    private static void AddFlagValue(List<string> cmd, string flag, string value)
+    {
+        if (value.StartsWith('-'))
+            cmd.Add($"--{flag}={value}");
+        else
+            cmd.AddRange([$"--{flag}", value]);
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -786,48 +874,7 @@ public class SubprocessTransport : ITransport
         if (_cwd != null)
             startInfo.WorkingDirectory = _cwd;
 
-        // Python commit 5839ff9: filter out CLAUDECODE so SDK-spawned subprocesses
-        // don't think they're running inside a Claude Code parent.
-        startInfo.Environment.Remove("CLAUDECODE");
-
-        // Set environment
-        foreach (var (key, value) in _options.Env)
-            startInfo.Environment[key] = value;
-
-        // Python commit 6d77aef: default CLAUDE_CODE_ENTRYPOINT only if absent
-        // (caller-provided value via options.Env wins).
-        if (!_options.Env.ContainsKey("CLAUDE_CODE_ENTRYPOINT"))
-            startInfo.Environment["CLAUDE_CODE_ENTRYPOINT"] = "sdk-dotnet";
-
-        startInfo.Environment["CLAUDE_AGENT_SDK_VERSION"] =
-            GetType().Assembly.GetName().Version?.ToString() ?? "0.1.0";
-
-        // Python commit bbec84d: propagate W3C trace context (TRACEPARENT/TRACESTATE)
-        // from the current Activity to the subprocess. No-op when there's no active
-        // Activity; options.Env always wins.
-        var activity = System.Diagnostics.Activity.Current;
-        if (activity != null && !string.IsNullOrEmpty(activity.Id))
-        {
-            if (!_options.Env.ContainsKey("TRACEPARENT"))
-                startInfo.Environment["TRACEPARENT"] = activity.Id;
-            else if (_options.Env.TryGetValue("TRACEPARENT", out var tp))
-                startInfo.Environment["TRACEPARENT"] = tp;
-
-            var tracestate = activity.TraceStateString;
-            if (!_options.Env.ContainsKey("TRACESTATE"))
-            {
-                if (!string.IsNullOrEmpty(tracestate))
-                    startInfo.Environment["TRACESTATE"] = tracestate;
-                else
-                    startInfo.Environment.Remove("TRACESTATE");
-            }
-        }
-
-        if (_options.EnableFileCheckpointing)
-            startInfo.Environment["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true";
-
-        if (_cwd != null)
-            startInfo.Environment["PWD"] = _cwd;
+        BuildEnvironment(startInfo.Environment);
 
         try
         {
@@ -881,6 +928,101 @@ public class SubprocessTransport : ITransport
             throw _exitError;
         }
     }
+
+    /// <summary>
+    /// Build the CLI's environment in place: <paramref name="env"/> starts as the
+    /// inherited environment (cleared first when
+    /// <see cref="ClaudeAgentOptions.InheritEnvironment"/> is false).
+    /// </summary>
+    internal void BuildEnvironment(IDictionary<string, string?> env)
+    {
+        // TS semantics: `env` replaces process.env instead of merging over it.
+        if (!_options.InheritEnvironment)
+            env.Clear();
+
+        // Python commit 5839ff9: filter out CLAUDECODE so SDK-spawned subprocesses
+        // don't think they're running inside a Claude Code parent.
+        env.Remove("CLAUDECODE");
+
+        // Set environment
+        foreach (var (key, value) in _options.Env)
+            env[key] = value;
+
+        // Python commit 6d77aef: default CLAUDE_CODE_ENTRYPOINT only if absent
+        // (caller-provided value via options.Env wins).
+        if (!_options.Env.ContainsKey("CLAUDE_CODE_ENTRYPOINT"))
+            env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-dotnet";
+
+        env["CLAUDE_AGENT_SDK_VERSION"] =
+            GetType().Assembly.GetName().Version?.ToString() ?? "0.1.0";
+
+        // Python commit bbec84d: propagate W3C trace context (TRACEPARENT/TRACESTATE)
+        // from the current Activity to the subprocess. No-op when there's no active
+        // Activity; options.Env always wins.
+        var activity = System.Diagnostics.Activity.Current;
+        if (activity != null && !string.IsNullOrEmpty(activity.Id))
+        {
+            if (!_options.Env.ContainsKey("TRACEPARENT"))
+                env["TRACEPARENT"] = activity.Id;
+            else if (_options.Env.TryGetValue("TRACEPARENT", out var tp))
+                env["TRACEPARENT"] = tp;
+
+            var tracestate = activity.TraceStateString;
+            if (!_options.Env.ContainsKey("TRACESTATE"))
+            {
+                if (!string.IsNullOrEmpty(tracestate))
+                    env["TRACESTATE"] = tracestate;
+                else
+                    env.Remove("TRACESTATE");
+            }
+        }
+
+        // Python 0.2.160: the query waits for the CLI's session_state_changed
+        // "idle" before closing stdin on a run that serves control requests.
+        // Ask for the frames it drops (sdk_host_only) unless the caller chose a
+        // value, in any case.
+        if (!env.Keys.Any(k => string.Equals(k, SdkReadsSessionStateEnv, StringComparison.OrdinalIgnoreCase)))
+            env[SdkReadsSessionStateEnv] = "1";
+
+        if (_options.EnableFileCheckpointing)
+            env["CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING"] = "true";
+
+        // TS: advertise the SDK-side token refresh callbacks.
+        if (_options.GetOAuthToken != null)
+            env["CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH"] = "1";
+        if (_options.GetHostAuthToken != null)
+            env["CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH"] = "1";
+
+        // TS toolConfig.askUserQuestion.
+        var ask = _options.ToolConfig?.AskUserQuestion;
+        if (ask?.PreviewFormat is { } preview)
+            env["CLAUDE_CODE_QUESTION_PREVIEW_FORMAT"] = preview == AskUserQuestionPreviewFormat.Html ? "html" : "markdown";
+        ApplyFlagEnv(env, ask?.ExtendedQuestions, "CLAUDE_CODE_QUESTION_EXTENDED");
+        ApplyFlagEnv(env, ask?.OptionalDescriptions, "CLAUDE_CODE_QUESTION_OPTIONAL_DESCRIPTIONS");
+
+        if (_cwd != null)
+            env["PWD"] = _cwd;
+    }
+
+    /// <summary>
+    /// TS: a true flag sets <c>KEY=1</c>; otherwise an inherited value is removed
+    /// (case-insensitively) unless the caller set it in <see cref="ClaudeAgentOptions.Env"/>.
+    /// </summary>
+    private void ApplyFlagEnv(IDictionary<string, string?> env, bool? flag, string key)
+    {
+        if (flag == true)
+        {
+            env[key] = "1";
+            return;
+        }
+        if (_options.Env.Keys.Any(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase)))
+            return;
+        foreach (var k in env.Keys.Where(k => string.Equals(k, key, StringComparison.OrdinalIgnoreCase)).ToList())
+            env.Remove(k);
+    }
+
+    /// <summary>Python: <c>_SDK_READS_SESSION_STATE_ENV</c>.</summary>
+    internal const string SdkReadsSessionStateEnv = "CLAUDE_CODE_SDK_READS_SESSION_STATE";
 
     private async Task HandleStderrAsync(CancellationToken cancellationToken)
     {

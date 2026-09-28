@@ -404,7 +404,7 @@ internal static class SessionTranscripts
 
     // ---- listing ---------------------------------------------------------------------------
 
-    private static List<SDKSessionInfo> ReadSessionsFromDir(string projectDir, string? projectPath)
+    private static List<SDKSessionInfo> ReadSessionsFromDir(string projectDir, string? projectPath, bool includeProgrammatic = true)
     {
         var results = new List<SDKSessionInfo>();
         IEnumerable<string> files;
@@ -424,6 +424,7 @@ internal static class SessionTranscripts
             var sessionId = name[..^".jsonl".Length];
             if (!SessionPaths.ValidateUuid(sessionId)) continue;
             if (ReadSessionLite(file) is not { } lite) continue;
+            if (!includeProgrammatic && IsProgrammaticSession(lite)) continue;
             if (ParseSessionInfoFromLite(sessionId, lite, projectPath) is { } info) results.Add(info);
         }
         return results;
@@ -459,18 +460,34 @@ internal static class SessionTranscripts
     }
 
     /// <summary>Python <c>list_sessions</c>.</summary>
-    public static List<SDKSessionInfo> ListSessions(string? directory, int? limit, int offset, bool includeWorktrees)
+    public static List<SDKSessionInfo> ListSessions(
+        string? directory, int? limit, int offset, bool includeWorktrees, bool includeProgrammatic = true)
     {
         if (!string.IsNullOrEmpty(directory))
-            return ListSessionsForProject(directory, limit, offset, includeWorktrees);
+            return ListSessionsForProject(directory, limit, offset, includeWorktrees, includeProgrammatic);
 
         var all = new List<SDKSessionInfo>();
         foreach (var dir in SafeEnumerateDirectories(SessionPaths.GetProjectsDir()))
-            all.AddRange(ReadSessionsFromDir(dir, null));
+            all.AddRange(ReadSessionsFromDir(dir, null, includeProgrammatic));
         return ApplySortLimitOffset(DeduplicateBySessionId(all), limit, offset);
     }
 
-    private static List<SDKSessionInfo> ListSessionsForProject(string directory, int? limit, int offset, bool includeWorktrees)
+    /// <summary>
+    /// TS <c>VO</c>: a programmatic / headless session (SDK entrypoint) or a
+    /// daemon / daemon-worker session. TS lists <c>sdk-cli</c>, <c>sdk-ts</c>
+    /// and <c>sdk-py</c>; this SDK's own <c>sdk-dotnet</c> counts too.
+    /// </summary>
+    internal static bool IsProgrammaticSession(LiteSessionFile lite)
+    {
+        var entrypoint = ExtractJsonStringField(lite.Head, "entrypoint") ?? ExtractLastJsonStringField(lite.Tail, "entrypoint");
+        if (entrypoint is "sdk-cli" or "sdk-ts" or "sdk-py" or "sdk-dotnet")
+            return true;
+        var line = lite.Head.Split('\n').FirstOrDefault(l => l.Contains("\"parentUuid\":", StringComparison.Ordinal)) ?? lite.Head;
+        return ExtractJsonStringField(line, "sessionKind") is "daemon" or "daemon-worker";
+    }
+
+    private static List<SDKSessionInfo> ListSessionsForProject(
+        string directory, int? limit, int offset, bool includeWorktrees, bool includeProgrammatic)
     {
         var canonicalDir = SessionPaths.CanonicalizePath(directory);
         var worktreePaths = includeWorktrees ? GetWorktreePaths(canonicalDir) : Array.Empty<string>();
@@ -479,7 +496,7 @@ internal static class SessionTranscripts
         {
             var projectDir = FindProjectDir(canonicalDir);
             if (projectDir is null) return new List<SDKSessionInfo>();
-            return ApplySortLimitOffset(ReadSessionsFromDir(projectDir, canonicalDir), limit, offset);
+            return ApplySortLimitOffset(ReadSessionsFromDir(projectDir, canonicalDir, includeProgrammatic), limit, offset);
         }
 
         var caseInsensitive = OperatingSystem.IsWindows();
@@ -503,7 +520,7 @@ internal static class SessionTranscripts
         {
             var projectDir = FindProjectDir(canonicalDir);
             if (projectDir is null) return new List<SDKSessionInfo>();
-            return ApplySortLimitOffset(ReadSessionsFromDir(projectDir, canonicalDir), limit, offset);
+            return ApplySortLimitOffset(ReadSessionsFromDir(projectDir, canonicalDir, includeProgrammatic), limit, offset);
         }
 
         var allSessions = new List<SDKSessionInfo>();
@@ -514,7 +531,7 @@ internal static class SessionTranscripts
         {
             var dirBase = Path.GetFileName(canonicalProjectDir);
             seenDirs.Add(caseInsensitive ? dirBase.ToLowerInvariant() : dirBase);
-            allSessions.AddRange(ReadSessionsFromDir(canonicalProjectDir, canonicalDir));
+            allSessions.AddRange(ReadSessionsFromDir(canonicalProjectDir, canonicalDir, includeProgrammatic));
         }
 
         foreach (var entry in allDirents)
@@ -531,7 +548,7 @@ internal static class SessionTranscripts
                                dirName.StartsWith(prefix + "-", StringComparison.Ordinal));
                 if (!isMatch) continue;
                 seenDirs.Add(dirName);
-                allSessions.AddRange(ReadSessionsFromDir(entry, wtPath));
+                allSessions.AddRange(ReadSessionsFromDir(entry, wtPath, includeProgrammatic));
                 break;
             }
         }
@@ -667,9 +684,10 @@ internal static class SessionTranscripts
         return chain;
     }
 
-    private static bool IsVisibleMessage(JsonObject entry)
+    private static bool IsVisibleMessage(JsonObject entry, bool includeSystemMessages = false)
     {
-        if (StringOf(entry, "type") is not ("user" or "assistant")) return false;
+        var type = StringOf(entry, "type");
+        if (type is not ("user" or "assistant") && !(includeSystemMessages && type == "system")) return false;
         if (Truthy(entry["isMeta"]) || Truthy(entry["isSidechain"])) return false;
         // isCompactSummary messages are intentionally included.
         return !Truthy(entry["teamName"]);
@@ -681,7 +699,7 @@ internal static class SessionTranscripts
         using (var doc = JsonDocument.Parse(entry["message"]?.ToJsonString() ?? "null"))
             message = doc.RootElement.Clone();
         return new SessionMessage(
-            Type: StringOf(entry, "type") == "user" ? "user" : "assistant",
+            Type: StringOf(entry, "type") switch { "user" => "user", "system" => "system", _ => "assistant" },
             Uuid: StringOf(entry, "uuid") ?? "",
             SessionId: StringOf(entry, "sessionId") ?? "",
             MessageData: message,
@@ -699,8 +717,12 @@ internal static class SessionTranscripts
     }
 
     /// <summary>Chain → visible messages → paging (Python <c>_entries_to_session_messages</c>).</summary>
-    public static List<SessionMessage> EntriesToSessionMessages(List<JsonObject> entries, int? limit, int offset)
-        => Page(BuildConversationChain(entries).Where(IsVisibleMessage).Select(e => ToSessionMessage(e)).ToList(), limit, offset);
+    public static List<SessionMessage> EntriesToSessionMessages(
+        List<JsonObject> entries, int? limit, int offset, bool includeSystemMessages = false)
+        => Page(BuildConversationChain(entries)
+                .Where(e => IsVisibleMessage(e, includeSystemMessages))
+                .Select(e => ToSessionMessage(e))
+                .ToList(), limit, offset);
 
     /// <summary>Python <c>_entries_to_subagent_messages</c>.</summary>
     public static List<SessionMessage> EntriesToSubagentMessages(
@@ -711,12 +733,13 @@ internal static class SessionTranscripts
                 .ToList(), limit, offset);
 
     /// <summary>Python <c>get_session_messages</c> (disk).</summary>
-    public static List<SessionMessage> GetSessionMessages(string sessionId, string? directory, int? limit, int offset)
+    public static List<SessionMessage> GetSessionMessages(
+        string sessionId, string? directory, int? limit, int offset, bool includeSystemMessages = false)
     {
         if (!SessionPaths.ValidateUuid(sessionId)) return new List<SessionMessage>();
         var content = ReadSessionFile(sessionId, directory);
         if (string.IsNullOrEmpty(content)) return new List<SessionMessage>();
-        return EntriesToSessionMessages(ParseTranscriptEntries(content), limit, offset);
+        return EntriesToSessionMessages(ParseTranscriptEntries(content), limit, offset, includeSystemMessages);
     }
 
     private static string? ReadSessionFile(string sessionId, string? directory)

@@ -128,6 +128,7 @@ Reference: `claude-agent-sdk-python` **0.2.158** (bundled CLI 2.1.280),
 | `stamp_user_message` | `QueryHandler.StampUserMessage` | added |
 | `ResultError` replaces the trailing `ProcessError` after an `is_error` result (`_error_result_text`: errors → result → non-success subtype → `API error (HTTP n)`) | `ResultException.FromResultFrame` / `ErrorResultText` | fixed (was a plain `ProcessException` with `errors`/subtype text and stderr placeholder) |
 | task-lifecycle ledger (#1088), transcript mirror, bidirectional stdin hold | same | ok |
+| 0.2.160 session-state handshake (#1190): env `CLAUDE_CODE_SDK_READS_SESSION_STATE=1` unless set (any case); `session_state_changed` with `sdk_host_only` dropped from the stream; stdin held until `idle` after a result (reopened by new main-thread work), bounded between turns by `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 10 min, `0` = no limit), disarmed by `requires_action` and by tracked agents | `SubprocessTransport.BuildEnvironment`, `QueryHandler` run lifecycle (`RunEndCeilingMs`, `OnSessionState`, `ArmRunEndCeiling`, …) | added |
 
 ## Errors (`_errors.py`)
 
@@ -169,13 +170,91 @@ Out of scope for this pass (listed for completeness):
 | `tool`, `create_sdk_mcp_server`, `SdkMcpTool`, `ToolAnnotations`, `McpSdkServerConfig` | `Mcp/*` (`McpServers.Sdk`, `McpSdkServerBuilder`, …) | MCP |
 | `list_sessions`, `get_session_info`, `get_session_messages`, `list_subagents`, `get_subagent_messages`, `*_from_store`, `rename/tag/delete/fork_session(_via_store)`, `ForkSessionResult`, `fold_session_summary`, `project_key_for_directory`, `import_session_to_store`, `InMemorySessionStore`, `SessionStore` types | `ClaudeSessions`, `Sessions/*`, `Types.Sessions.cs` | Sessions |
 
+## TypeScript SDK parity (`@anthropic-ai/claude-agent-sdk` 0.3.283)
+
+Wire shapes checked against `sdk.mjs` (`Query.processControlRequest`, the `Query` request
+methods, `buildInitializeRequest`, the `ProcessTransport` argv builder and the option intake).
+Tests: `TsControlParityTests`, `TsOptionsParityTests`.
+
+### Control protocol: inbound (CLI → SDK)
+
+| TS behavior | .NET | Status |
+|---|---|---|
+| `elicitation` → `onElicitation` (`{action, content?}`); no handler → `{"action":"decline"}`; `null` → no response | `ClaudeAgentOptions.OnElicitation` (`ElicitationRequest`, `ElicitationResult`) | added (was an error reply) |
+| `request_user_dialog` → `onUserDialog` (`{behavior:"completed",result}` / `{behavior:"cancelled"}`); no handler → silent | `OnUserDialog`, `SupportedDialogKinds` (`UserDialogResult.Completed/Cancelled`) | added |
+| `oauth_token_refresh` → `getOAuthToken` (`{accessToken, reason?}`; reason only with a null token and a known value); `host_auth_token_refresh` → `getHostAuthToken` (`{authToken}`); no callback → error | `GetOAuthToken` (`OAuthTokenResult`, `OAuthDeclineReason`), `GetHostAuthToken` | added (string host token only; the TS object form is not supported) |
+| `remote_tool_call`, `remote_plumbing_call`, `remote_tools_probe`, `remote_tools_reannounce` stay unanswered | `SilentSubtypes` | added |
+| callback `null` suppresses the response (`can_use_tool`, elicitation, dialogs) | internal `SuppressResponse` sentinel | added |
+| duplicate delivery of an in-flight `request_id` skipped | `DispatchInboundControlRequestAsync` | added |
+| `can_use_tool` context: `mcpServer`, `defaultToNo`, `suppressAlwaysAllowRule`, `matchedAskRule`, `requiresUserInteraction`, `serverPrompt`, `computerFolder`, `requestId` (+ `decision_reason_type`, `classifier_approvable`) | `ToolPermissionContext` init members | added |
+| `can_use_tool` response echoes `toolUseID`, carries `decisionClassification` | `PermissionResultAllow/Deny.ToolUseId`, `.DecisionClassification` | added (request id wins, as in TS) |
+| `pending_permission_requests` / `pending_user_dialog_requests` on an **initialize** response redelivered (other responses: ignored) | `HandleControlResponseAsync` → `RedeliverAsync` | added |
+| `keep_alive` dropped; `system/commands_changed` cached for `supportedCommands()` | read loop | added |
+| unknown subtype → error reply | same | ok |
+
+### Control protocol: outbound (SDK → CLI)
+
+| TS `Query` method | Wire | .NET `ClaudeSDKClient` | Status |
+|---|---|---|---|
+| `interrupt()` receipt, `{cancelQueued}` | `{"subtype":"interrupt","cancel_queued":true}` → `{still_queued,cancelled?}` | `InterruptAsync(bool cancelQueued)` → `InterruptReceipt?` | added (void overload kept) |
+| `rewindFiles(id, {dryRun})` | `dry_run` | `RewindFilesAsync(id, bool dryRun)` → `RewindFilesResult` | added (void overload kept) |
+| `getContextUsage({detail})` | `detail: "summary"\|"full"` | `GetContextUsageAsync(ContextUsageDetail)` | added |
+| `setMaxThinkingTokens(n, display?)` | `thinking_display` omitted / value / `null` | `SetMaxThinkingTokensAsync(int?, ThinkingDisplayMode?, bool clearThinkingDisplay)` | added |
+| `setMcpPermissionModeOverride` | `serverName`, `mode` → `{warning?}` | `SetMcpPermissionModeOverrideAsync` → `string?` | added |
+| `applyFlagSettings` | `settings` (nulls kept) | `ApplyFlagSettingsAsync(IReadOnlyDictionary<string, object?>)` | added |
+| `updateSettings` | `source`, `settings` | `UpdateSettingsAsync(SettingsFileSource, …)` | added |
+| `initializationResult`, `reinitialize`, `supportedCommands/Models/Agents`, `accountInfo` | cached / fresh `initialize` | `InitializationResultAsync`, `ReinitializeAsync`, `SupportedCommandsAsync` (follows `commands_changed`), `SupportedModelsAsync`, `SupportedAgentsAsync`, `AccountInfoAsync` | added |
+| `readFile` (null on error) | `path`, `max_bytes?`, `encoding?` | `ReadFileAsync` → `ReadFileResult?` | added |
+| `reloadPlugins({holdOnCacheImpact})`, `reloadSkills`, `reloadOutputStyles` | `hold_on_cache_impact` | `ReloadPluginsAsync` → `ReloadPluginsResult`, `ReloadSkillsAsync`, `ReloadOutputStylesAsync` | added |
+| `seedReadState` | `path`, `mtime` | `SeedReadStateAsync` | added |
+| `readMcpResource` (@alpha) | `serverName`, `uri` | `ReadMcpResourceAsync` → `McpReadResourceResult` | added |
+| `setMcpServers` | SDK servers registered locally and sent as `{type:"sdk",name,timeout?}` | `SetMcpServersAsync` → `McpSetServersResult` | added |
+| `backgroundTasks(toolUseId?)` | `tool_use_id?` → `backgrounded ?? true` | `BackgroundTasksAsync` | added |
+| `usage_EXPERIMENTAL_…({skipBehaviors})` | `get_usage`, `skip_behaviors?` | `[Experimental("CLAUDESDK001")] GetUsageAsync` → `UsageReport` | added |
+| in-process server → CLI `mcp_message` (fire-and-forget) | `{"subtype":"mcp_message","server_name","message"}` | `SendMcpServerMessageAsync`, `NotifyMcpToolsListChangedAsync` | added |
+| AbortSignal after write → `control_cancel_request` | `{"type":"control_cancel_request","request_id"}` | every control call: cancellation → cancel frame + `OperationCanceledException`; only a real timeout throws `Control request timeout: <subtype>` | fixed |
+| undocumented: `claude_authenticate`, `claude_oauth_callback`, `claude_oauth_wait_for_completion`, `get_settings`, `rename_session`, `generate_session_title`, `cancel_async_message`, `side_question` | as TS | `[Experimental("CLAUDESDK002")]` wrappers | added |
+| every other subtype (`get_hooks_listing`, `list_permission_rules`, `set_cwd`, `mcp_authenticate`, chrome/dialog/feedback/remote-control, …) | — | `SendControlRequestAsync(subtype, fields, timeout, ct)` escape hatch | added |
+| `prewarm` / `startup` (`claim_session`, `--await-claim`), `resolveSettings`, `DirectConnectTransport` | — | — | not ported (needs a spawn-and-claim transport / the CLI settings engine) |
+
+### Options
+
+| TS option | Wire | .NET | Status |
+|---|---|---|---|
+| `persistSession: false` | `--no-session-persistence` (error with `sessionStore`) | `PersistSession` | added |
+| `allowDangerouslySkipPermissions`, `agent`, `debug`/`debugFile`, `permissionPrompts`, `projectConfigRoot`, `managedSettings`, `channels`, `workload` | argv (`--project-config-root=` equals form; `--channels`/`--workload` bind dash-leading values with `=`) | same names | added |
+| `fallbackModel === model` rejected | — | `ArgumentException` in `BuildCommand` | added |
+| `thinking: {type:"enabled"}` without budget → `--thinking adaptive` | argv | `ThinkingConfigEnabled(int? BudgetTokens = null)` | added |
+| `systemPrompt: string[]` / custom `prompt: string[]`, `SYSTEM_PROMPT_DYNAMIC_BOUNDARY` | initialize `systemPrompt`, no argv | `SystemPromptBlocks`, `SystemPromptConfig.DynamicBoundary` (string/preset/file forms stay on argv) | added |
+| `outputFormat` | also initialize `jsonSchema` | same option | added |
+| `title`, `planModeInstructions`, `toolAliases`, `promptSuggestions`, `agentProgressSummaries`, `supportedDialogKinds` (needs `onUserDialog`), `perTaskStopAffordance` | initialize keys (sent only when set) | same names | added |
+| hidden: `appendSubagentSystemPrompt`, `webSearchIsolationExemptMcpServers`, `rapidFollowupPreempt`, `workspaceTrust` (dropped when accepted without an absolute dir) | initialize keys | same names | added |
+| `pluginDelivery: "initialize"` | `--await-initialize` + initialize `plugins` (warns unless `plugins_applied`) | `PluginDelivery` | added |
+| plugin `skipMcpDiscovery` | `--plugin-dir-no-mcp` | `SdkPluginConfig.SkipMcpDiscovery` | added |
+| sandbox `failIfUnavailable` injected when `enabled` | `--settings` | `SandboxSettings.FailIfUnavailable` + `filesystem`, `credentials`, `enableWeakerNetworkIsolation`, `allowAppleEvents`, `ripgrep`, `bwrapPath`, `socatPath`, `network.strictAllowlist`, `network.tlsTerminate`, `AdditionalProperties` | added |
+| MCP `timeout`, `alwaysLoad`, `tools[]` policies; SDK server `timeout` | `--mcp-config`; initialize `sdkMcpServerConfigs` | `McpStdio/SSE/HttpServerConfig`, `McpServerToolPolicy`, `McpSdkServerConfig.Timeout` | added |
+| AgentDefinition `criticalSystemReminder_EXPERIMENTAL`, `omitClaudeMd`, `observer`, `observerMessage` | initialize `agents` | `AgentDefinition` init members | added |
+| `toolConfig.askUserQuestion` (`previewFormat`, hidden `extendedQuestions`/`optionalDescriptions`) | env `CLAUDE_CODE_QUESTION_*` (inherited flags removed unless requested or set in `Env`) | `ToolConfig` | added |
+| `getOAuthToken` / `getHostAuthToken` | env `CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH=1` / `…_HOST_AUTH_REFRESH=1` | same | added |
+| `env` replaces `process.env` | — | `InheritEnvironment = false` | added (default stays Python's merge; `NODE_OPTIONS`/`DEBUG` stripping not ported: the CLI is a native binary) |
+| bidirectional stdin hold also for `onElicitation`, `onUserDialog`, `getOAuthToken`, `getHostAuthToken` | — | `HasBidirectionalNeeds` | added |
+| `settings` as an object | `--settings <json>` | builder `Settings(JsonElement)` / `Settings(IReadOnlyDictionary)` (option stays `string`) | added |
+| `spawnClaudeCodeProcess`, SDK MCP manifest capture (`sdkMcpServerManifests`, `sdkMcpServers`), `executable`/`executableArgs` | — | — | not ported (custom `ITransport` covers spawning; SDK servers stay in `--mcp-config` as in Python) |
+| (.NET) raw frame tap | — | `OnRawMessage` (every stdout frame before routing, control frames included) | added |
+
+### Sessions
+
+| TS | .NET | Status |
+|---|---|---|
+| `listSessions({includeProgrammatic})` (hides `sdk-cli`/`sdk-ts`/`sdk-py` entrypoints and daemon sessions) | `ClaudeSessions.ListSessions(…, includeProgrammatic)`; also hides `sdk-dotnet` | added |
+| `getSessionMessages({includeSystemMessages})` | `GetSessionMessages(…, includeSystemMessages)`, store overload of `GetSessionMessagesAsync` | added |
+
 ## Follow-ups
 
 1. ~~**Sessions**: non-positive `load_timeout_ms`~~ — resolved: `MaterializeResumeSessionAsync`
    accepts `TimeSpan.Zero` (and negative spans) as an immediate timeout and `LoadTimeoutMs` is
    passed through unclamped.
-2. **Sessions**: Python's local-disk `fork_session()` has no .NET counterpart (only
-   `SessionMutations.ForkSessionViaStoreAsync`).
+2. ~~**Sessions**: local-disk `fork_session()`~~ — resolved: `ClaudeSessions.ForkSession`.
 3. ~~**MCP** notification ack / unknown-server text~~ — resolved: `SdkMcpBridge.HandleAsync`
    returns no reply for notifications and `QueryHandler` acks them with
    `{"jsonrpc":"2.0","result":{}}`; unknown servers answer `Server '<name>' not found`.

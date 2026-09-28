@@ -18,7 +18,7 @@ namespace Claude.AgentSdk;
 ///     .Build();
 /// </code>
 /// </example>
-public sealed class ClaudeAgentOptionsBuilder
+public sealed partial class ClaudeAgentOptionsBuilder
 {
     private IReadOnlyList<string>? _tools;
     private readonly List<string> _allowedTools = [];
@@ -612,7 +612,7 @@ public sealed class ClaudeAgentOptionsBuilder
 #pragma warning disable CS0618 // MaxThinkingTokens is obsolete but we still need to wire it through
     public ClaudeAgentOptions Build()
     {
-        return new ClaudeAgentOptions
+        var options = new ClaudeAgentOptions
         {
             Tools = _tools,
             AllowedTools = _allowedTools.Count > 0 ? _allowedTools : [],
@@ -665,6 +665,7 @@ public sealed class ClaudeAgentOptionsBuilder
             VerbatimPrompts = _verbatimPrompts,
             LoadTimeoutMs = _loadTimeoutMs
         };
+        return ApplyTsOptions(options);
     }
 #pragma warning restore CS0618
 }

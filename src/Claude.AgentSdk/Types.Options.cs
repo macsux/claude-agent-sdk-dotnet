@@ -24,7 +24,7 @@ namespace Claude.AgentSdk;
 /// <see cref="SystemPromptFile"/>. A <see cref="string"/> converts implicitly
 /// to <see cref="SystemPromptText"/>.
 /// </remarks>
-public abstract record SystemPromptConfig
+public abstract partial record SystemPromptConfig
 {
     private protected SystemPromptConfig() { }
 
