@@ -943,7 +943,7 @@ internal partial class QueryHandler : IAsyncDisposable
         {
             RequestId = requestId,
             McpServer = request.TryGetProperty("mcp_server", out var ms) && ms.ValueKind == JsonValueKind.Object
-                ? new McpServerProvenance(OptString(ms, "name"), OptString(ms, "source"))
+                ? new McpServerProvenance(OptString(ms, "name") ?? string.Empty, OptString(ms, "source") ?? string.Empty)
                 : null,
             DefaultToNo = OptBool(request, "default_to_no"),
             SuppressAlwaysAllowRule = OptBool(request, "suppress_always_allow_rule"),

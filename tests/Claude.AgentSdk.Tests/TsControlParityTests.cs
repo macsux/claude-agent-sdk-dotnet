@@ -862,7 +862,8 @@ public sealed class TsControlParityTests
 
         var skills = await client.ReloadSkillsAsync();
         Assert.Equal("""{"subtype":"reload_skills"}""", LastRequest(t, "reload_skills"));
-        Assert.Equal(new SlashCommand("pdf", "PDF", "<file>"), Assert.Single(skills));
+        var skill = Assert.Single(skills);
+        Assert.Equal(("pdf", "PDF", "<file>"), (skill.Name, skill.Description, skill.ArgumentHint));
 
         Assert.Equal(["default", "Explanatory"], await client.ReloadOutputStylesAsync());
         Assert.Equal("""{"subtype":"reload_output_styles"}""", LastRequest(t, "reload_output_styles"));
@@ -1100,9 +1101,12 @@ public sealed class TsControlParityTests
         var init = await client.InitializationResultAsync();
         Assert.Equal("default", init.OutputStyle);
         Assert.Equal(["default", "Learning"], init.AvailableOutputStyles);
-        Assert.Equal(new SlashCommand("compact", "Compact", "[focus]"), Assert.Single(await client.SupportedCommandsAsync()));
-        Assert.Equal(new AgentInfo("reviewer", "Reviews", null), Assert.Single(await client.SupportedAgentsAsync()));
-        Assert.Equal(new ModelInfo("opus", "Opus", "Big"), Assert.Single(await client.SupportedModelsAsync()));
+        var command = Assert.Single(await client.SupportedCommandsAsync());
+        Assert.Equal(("compact", "Compact", "[focus]"), (command.Name, command.Description, command.ArgumentHint));
+        var agent = Assert.Single(await client.SupportedAgentsAsync());
+        Assert.Equal(("reviewer", "Reviews", (string?)null), (agent.Name, agent.Description, agent.Model));
+        var model = Assert.Single(await client.SupportedModelsAsync());
+        Assert.Equal(("opus", "Opus", "Big"), (model.Value, model.DisplayName, model.Description));
         var account = await client.AccountInfoAsync();
         Assert.Equal(("a@b.c", "Org", "max", "oauth", null, "firstParty"),
             (account!.Email, account.Organization, account.SubscriptionType, account.TokenSource, account.ApiKeySource, account.ApiProvider));

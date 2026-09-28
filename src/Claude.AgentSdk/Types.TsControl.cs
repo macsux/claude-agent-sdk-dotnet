@@ -355,9 +355,6 @@ public delegate Task<string?> HostAuthTokenCallback(CancellationToken cancellati
 
 #region can_use_tool context and result extras
 
-/// <summary>Which MCP server a tool belongs to (<c>mcp_server</c>).</summary>
-public sealed record McpServerProvenance(string? Name, string? Source);
-
 /// <summary>The ask rule that triggered a permission prompt (<c>matched_ask_rule</c>).</summary>
 public sealed record MatchedAskRule(string? Source, string? ToolName, string? RuleContent);
 
