@@ -57,6 +57,7 @@ public class SubprocessTransport : ITransport
 
     private readonly ClaudeAgentOptions _options;
     private string? _cliPath; // Python commit 19e1f53: deferred CLI discovery to ConnectAsync.
+    private CliLaunch? _launch; // _cliPath with Windows .cmd shims resolved (see CliLauncher)
     private readonly string? _cwd;
     private readonly int _maxBufferSize;
     private readonly ILogger _logger;
@@ -105,8 +106,8 @@ public class SubprocessTransport : ITransport
             return cliPathEnv;
 
         // Check PATH. Python: shutil.which("claude"), preferring a native
-        // executable on Windows over npm's claude.cmd shim (which ConnectAsync
-        // refuses to run — see RejectWindowsBatchCli).
+        // executable on Windows over npm's claude.cmd shim (which Launch
+        // resolves to its target rather than running — see CliLauncher).
         string? whichHit = null;
         var hit = Which("claude");
         if (hit != null)
@@ -122,10 +123,11 @@ public class SubprocessTransport : ITransport
         // Check common locations
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
-        // Windows: only the native installer's claude.exe (Python parity). The
-        // npm .cmd shims are deliberately not probed.
+        // Windows: the native installer's claude.exe, then npm's default global
+        // prefix (its claude.cmd is resolved by CliLauncher, never run).
+        var appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
         var locations = OperatingSystem.IsWindows()
-            ? new[] { Path.Combine(home, ".local", "bin", "claude.exe") }
+            ? new[] { Path.Combine(home, ".local", "bin", "claude.exe"), Path.Combine(appData, "npm", "claude.cmd") }
             : new[]
             {
                 Path.Combine(home, ".npm-global", "bin", "claude"),
@@ -142,8 +144,8 @@ public class SubprocessTransport : ITransport
                 return path;
         }
 
-        // No native executable anywhere: return the shim so ConnectAsync raises
-        // the explanatory batch-script refusal rather than a bare not-found.
+        // No native executable anywhere: return the shim; CliLauncher resolves
+        // it to its target (or explains why it can't).
         if (whichHit != null)
             return whichHit;
 
@@ -154,8 +156,7 @@ public class SubprocessTransport : ITransport
                 "  irm https://claude.ai/install.ps1 | iex\n" +
                 "\nOr provide the path to a claude.exe via ClaudeAgentOptions:\n" +
                 "  new ClaudeAgentOptions { CliPath = @\"C:\\path\\to\\claude.exe\" }\n" +
-                "\n(npm install -g @anthropic-ai/claude-code produces a claude.cmd shim, " +
-                "which this SDK refuses to run on Windows.)"
+                "\nor install with npm (npm install -g @anthropic-ai/claude-code)."
             );
         }
 
@@ -248,29 +249,6 @@ public class SubprocessTransport : ITransport
             }
         }
         return false;
-    }
-
-    /// <summary>
-    /// Refuse to execute a .bat/.cmd script as the CLI on Windows.
-    /// </summary>
-    /// <remarks>
-    /// CreateProcess runs batch scripts via <c>cmd.exe /c</c>, which re-parses
-    /// the command line. .NET quotes ArgumentList entries for the MSVCRT rules
-    /// only, so cmd.exe metacharacters inside an argument (a prompt, a session
-    /// title passed to --resume, ...) can execute injected commands
-    /// (CVE-2024-27980 "BatBadBut" class). No reliable cmd.exe escaping exists,
-    /// so the only safe option is refusing. Python: <c>_reject_windows_batch_cli</c>.
-    /// </remarks>
-    internal static void RejectWindowsBatchCli(string cliPath, bool isWindows)
-    {
-        if (!isWindows || !IsBatchScriptPath(cliPath))
-            return;
-        throw new CliConnectionException(
-            $"Refusing to execute batch script '{cliPath}': Windows runs .bat/.cmd files via cmd.exe, " +
-            "which can execute commands injected through CLI arguments, and no reliable escaping for " +
-            "cmd.exe exists. Use a native claude executable instead: install Claude Code natively " +
-            "(irm https://claude.ai/install.ps1 | iex) or point ClaudeAgentOptions.CliPath at a claude.exe."
-        );
     }
 
     // cmd.exe metacharacters, the quote that toggles its quoting state, and "!"
@@ -479,10 +457,24 @@ public class SubprocessTransport : ITransport
         return parsed?.ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
     }
 
-    internal List<string> BuildCommand()
+    /// <summary>
+    /// The process to start for the CLI: discovered on first use, then run
+    /// through <see cref="CliLauncher"/> so a Windows npm shim launches its
+    /// target directly instead of via cmd.exe.
+    /// </summary>
+    private CliLaunch Launch()
     {
         _cliPath ??= FindCli();
-        var cmd = new List<string> { _cliPath, "--output-format", "stream-json", "--verbose" };
+        return _launch ??= CliLauncher.Resolve(_cliPath, LaunchPath());
+    }
+
+    /// <summary>PATH the child will see (options.Env overrides this process's).</summary>
+    private string? LaunchPath() =>
+        _options.Env.FirstOrDefault(kv => string.Equals(kv.Key, "PATH", StringComparison.OrdinalIgnoreCase)).Value;
+
+    internal List<string> BuildCommand()
+    {
+        var cmd = Launch().Command(["--output-format", "stream-json", "--verbose"]);
 
         // System prompt (Python _build_command). The preset's
         // exclude_dynamic_sections / snapshot and the custom form's snapshot
@@ -843,9 +835,9 @@ public class SubprocessTransport : ITransport
         // Python commit 19e1f53: defer CLI discovery to ConnectAsync.
         _cliPath ??= await Task.Run(FindCli, cancellationToken);
 
-        // Validate the resolved CLI before anything is spawned with it --
-        // this guards the version probe below as well as the main spawn.
-        RejectWindowsBatchCli(_cliPath, OperatingSystem.IsWindows());
+        // Resolve (or refuse) a Windows batch shim before anything is spawned
+        // with it -- this guards the version probe below as well as the main spawn.
+        Launch();
 
         // Check CLI version
         if (Environment.GetEnvironmentVariable("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK") == null)
@@ -1218,13 +1210,14 @@ public class SubprocessTransport : ITransport
 
             var startInfo = new ProcessStartInfo
             {
-                FileName = _cliPath,
+                FileName = Launch().FileName,
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 CreateNoWindow = true
             };
-            startInfo.ArgumentList.Add("-v");
+            foreach (var arg in Launch().Command(["-v"]).Skip(1))
+                startInfo.ArgumentList.Add(arg);
 
             process = Process.Start(startInfo);
             if (process == null) return;

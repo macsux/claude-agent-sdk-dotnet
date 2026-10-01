@@ -35,15 +35,6 @@ public sealed class TransportSecurityTests
         Assert.False(SubprocessTransport.IsBatchScriptPath(path));
     }
 
-    [Fact]
-    public void RejectWindowsBatchCli_ThrowsOnWindowsOnly()
-    {
-        Assert.Throws<CliConnectionException>(() =>
-            SubprocessTransport.RejectWindowsBatchCli(@"C:\npm\claude.cmd", isWindows: true));
-        SubprocessTransport.RejectWindowsBatchCli(@"C:\npm\claude.cmd", isWindows: false);
-        SubprocessTransport.RejectWindowsBatchCli(@"C:\bin\claude.exe", isWindows: true);
-    }
-
     [Theory]
     [InlineData("abc & calc")]
     [InlineData("%PATH%")]
