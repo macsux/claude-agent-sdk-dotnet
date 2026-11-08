@@ -203,4 +203,23 @@ public class SessionTests(ITestOutputHelper output) : IntegrationTestBase(output
         Assert.Contains(after, result.Result);
         Assert.Contains(nonce, result.Result);
     }
+    [IntegrationFact]
+    public async Task Clear_SentAsAMessage_DropsTheConversation()
+    {
+        // FrigginAI's Start building with Clear context sends /clear as a user message in a live session.
+        var nonce = NewNonce("CODE");
+        var options = Options();
+        await using var client = new ClaudeSDKClient(options, Transport(options));
+        await client.ConnectAsync(cancellationToken: Ct);
+        await client.QueryAsync(Plant(nonce), cancellationToken: Ct);
+        Assert.Equal("success", SingleResult(await CollectAsync(client.ReceiveResponseAsync(Ct))).Subtype);
+
+        await client.QueryAsync("/clear", cancellationToken: Ct);
+        await CollectAsync(client.ReceiveResponseAsync(Ct));
+
+        await client.QueryAsync(AskForCode + " Say UNKNOWN if you don't know it.", cancellationToken: Ct);
+        var result = SingleResult(await CollectAsync(client.ReceiveResponseAsync(Ct)));
+        Assert.Equal("success", result.Subtype);
+        Assert.DoesNotContain(nonce, result.Result);
+    }
 }
