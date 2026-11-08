@@ -198,4 +198,40 @@ public class HookTests(ITestOutputHelper output) : IntegrationTestBase(output)
         Assert.Equal("success", SingleResult(messages).Subtype);
         Assert.Contains(secret, AllAssistantText(messages));
     }
+    [IntegrationFact]
+    public async Task UserPromptSubmit_AdditionalContext_CanBeSwitchedOnMidSession()
+    {
+        // FrigginAI's Plan mode: the same live session gets rules from a later turn on,
+        // without a new session or system prompt.
+        var secret = NewNonce("SECRET");
+        var on = false;
+        var options = Options() with
+        {
+            Hooks = new Dictionary<HookEvent, IReadOnlyList<HookMatcher>>
+            {
+                [HookEvent.UserPromptSubmit] = [Matcher(null, (_, _, _, _) => Task.FromResult(Volatile.Read(ref on)
+                    ? new HookOutput
+                    {
+                        HookSpecificOutput = new UserPromptSubmitHookSpecificOutput
+                        {
+                            AdditionalContext = $"The secret word is {secret}.",
+                        }.ToJsonElement(),
+                    }
+                    : new HookOutput()))],
+            },
+        };
+
+        await using var client = new ClaudeSDKClient(options, Transport(options));
+        await client.ConnectAsync(cancellationToken: Ct);
+        const string prompt = "What is the secret word? Reply with only the secret word, or NONE if you don't know one.";
+        await client.QueryAsync(prompt, cancellationToken: Ct);
+        var first = await CollectAsync(client.ReceiveResponseAsync(Ct));
+        Assert.DoesNotContain(secret, AllAssistantText(first));
+
+        Volatile.Write(ref on, true);
+        await client.QueryAsync(prompt, cancellationToken: Ct);
+        var second = await CollectAsync(client.ReceiveResponseAsync(Ct));
+        Assert.Equal("success", SingleResult(second).Subtype);
+        Assert.Contains(secret, AllAssistantText(second));
+    }
 }
