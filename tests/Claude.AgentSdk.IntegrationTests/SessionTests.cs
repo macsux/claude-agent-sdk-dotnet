@@ -176,4 +176,31 @@ public class SessionTests(ITestOutputHelper output) : IntegrationTestBase(output
         Assert.True(store.GetEntries(new SessionKey { ProjectKey = projectKey, SessionId = result.SessionId }).Count > entries.Count
                     || result.SessionId != seed.SessionId);
     }
+    [IntegrationFact]
+    public async Task Resume_WithSnapshotOff_TakesNewSystemPrompt_AndKeepsHistory()
+    {
+        // FrigginAI resumes a chat under a new system prompt (a converted chat): with the
+        // recorded prompt kept (the default) the new append is ignored; with snapshot off it
+        // applies, and the history is still there.
+        var nonce = NewNonce("CODE");
+        var before = NewNonce("ALPHA");
+        var after = NewNonce("GAMMA");
+        static string Sign(string word) => $"Start every reply with the sign-off word {word} on its own line.";
+        var seed = await PlantAsync(nonce, Options() with { SystemPrompt = SystemPromptPreset.ClaudeCode(Sign(before)) });
+
+        var kept = Options() with { Resume = seed.SessionId, SystemPrompt = SystemPromptPreset.ClaudeCode(Sign(after)) };
+        var keptResult = SingleResult(await CollectAsync(Claude.QueryAsync(AskForCode, kept, Transport(kept, suffix: "kept"), Ct)));
+        Assert.Contains(before, keptResult.Result);
+        Assert.DoesNotContain(after, keptResult.Result);
+
+        var fresh = Options() with
+        {
+            Resume = seed.SessionId,
+            SystemPrompt = SystemPromptPreset.ClaudeCode(Sign(after)) with { Snapshot = false },
+        };
+        var result = SingleResult(await CollectAsync(Claude.QueryAsync(AskForCode, fresh, Transport(fresh), Ct)));
+        Assert.Equal("success", result.Subtype);
+        Assert.Contains(after, result.Result);
+        Assert.Contains(nonce, result.Result);
+    }
 }
